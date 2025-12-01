@@ -1,8 +1,54 @@
 """
 Lightweight HTTP + WebSocket server with plugin system.
+
+A minimal, zero-dependency HTTP and WebSocket server designed for
+development and prototyping. Features middleware, routing, plugins,
+and WebSocket support out of the box.
+
+Example:
+    >>> from pykrozen import Server, get
+    >>> @get("/hello")
+    ... def hello(req):
+    ...     return {"message": "Hello, World!"}
+    >>> Server.run(port=8000)
 """
 
 from __future__ import annotations
+
+__version__ = "0.1.0"
+__all__ = [
+    # Version
+    "__version__",
+    # Core classes
+    "Server",
+    "App",
+    "Plugin",
+    # Request/Response
+    "Request",
+    "Response",
+    # WebSocket
+    "WSClient",
+    "WSMessage",
+    "WSContext",
+    # Context types
+    "HTTPContext",
+    "ServerContext",
+    "Route",
+    # Global app and decorators
+    "app",
+    "get",
+    "post",
+    "on",
+    "use",
+    # Factory functions
+    "make_request",
+    "make_response",
+    # Type aliases
+    "MiddlewareFn",
+    "RouteHandler",
+    "HookHandler",
+    "PluginProtocol",
+]
 
 import json
 import os

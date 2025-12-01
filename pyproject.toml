@@ -3,12 +3,56 @@ name = "pykrozen"
 version = "0.1.0"
 description = "Lightweight HTTP + WebSocket Server (Development Use Only)"
 readme = "README.md"
+license = "BSD-3-Clause"
 authors = [
     { name = "hlop3z", email = "23062270+hlop3z@users.noreply.github.com" },
 ]
 requires-python = ">=3.12"
 dependencies = []
+keywords = [
+    "http",
+    "websocket",
+    "server",
+    "development",
+    "lightweight",
+    "plugin",
+    "middleware",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: BSD License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/hlop3z/pykrozen"
+Repository = "https://github.com/hlop3z/pykrozen"
+Issues = "https://github.com/hlop3z/pykrozen/issues"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pykrozen"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
