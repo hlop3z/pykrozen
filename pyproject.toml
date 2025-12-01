@@ -56,3 +56,29 @@ line-length = 88
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pylint.messages_control]
+disable = [
+    "too-few-public-methods",      # R0903: SimpleNamespace subclasses don't need methods
+    "missing-function-docstring",  # C0116: Private/override methods don't need docstrings
+    "redefined-outer-name",        # W0621: Intentional for Plugin.setup(app) parameter
+    "redefined-builtin",           # W0622: Required for BaseHTTPRequestHandler.log_message
+    "invalid-name",                # C0103: do_GET/do_POST required by BaseHTTPRequestHandler
+    "protected-access",            # W0212: Internal server loop access is intentional
+    "consider-using-in",           # R1714: Style preference
+]
+
+[dependency-groups]
+dev = [
+    "black>=25.9.0",
+    "isort>=7.0.0",
+    "mypy>=1.18.2",
+    "pdoc>=16.0.0",
+    "pylint>=4.0.3",
+    "ruff>=0.14.1",
+    "pytest>=9.0.1",
+    "pytest-cov>=7.0.0",
+    "pytest-mock>=3.15.1",
+    "ssort>=0.15.0",
+    "pyright>=1.1.407",
+]

@@ -56,11 +56,11 @@ import socket
 import struct
 import threading
 from base64 import b64encode
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from hashlib import sha1
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
-from collections.abc import Callable
 from typing import Any, NamedTuple, Protocol
 
 WS_MAGIC = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -76,7 +76,7 @@ class Route(NamedTuple):
 
     method: str
     path: str
-    handler: Callable
+    handler: Callable[..., Any]
 
 
 class Request(SimpleNamespace):
@@ -103,6 +103,77 @@ class HTTPContext(NamedTuple):
 
     req: Request
     res: Response
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# WebSocket Client
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class WSClient:
+    """WebSocket client connection. Use 'data' namespace for per-connection state."""
+
+    sock: socket.socket
+    data: SimpleNamespace = field(default_factory=SimpleNamespace)
+
+    def handshake(self) -> None:
+        """Perform WebSocket handshake."""
+        req = self.sock.recv(1024)
+        key = next(
+            line.split(b": ", 1)[1]
+            for line in req.split(b"\r\n")
+            if line.lower().startswith(b"sec-websocket-key")
+        )
+        accept = b64encode(sha1(key + WS_MAGIC).digest())
+        self.sock.send(
+            b"HTTP/1.1 101 Switching Protocols\r\n"
+            b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+        )
+
+    def recv(self) -> tuple[int | None, bytes | None]:
+        """Receive a WebSocket frame. Returns (opcode, data)."""
+        header = self.sock.recv(2)
+        if len(header) < 2:
+            return None, None
+
+        opcode = header[0] & 0x0F
+        length = header[1] & 0x7F
+
+        if length == 126:
+            length = struct.unpack(">H", self.sock.recv(2))[0]
+        elif length == 127:
+            length = struct.unpack(">Q", self.sock.recv(8))[0]
+
+        if header[1] & 0x80:
+            mask = self.sock.recv(4)
+            payload = self.sock.recv(length)
+            data = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        else:
+            data = self.sock.recv(length)
+
+        return opcode, data
+
+    def send(self, data: Any, opcode: int = 1) -> None:
+        """Send data over WebSocket. Auto-serializes dicts to JSON."""
+        if opcode == 1 and not isinstance(data, (str, bytes)):
+            data = json.dumps(data)
+        payload = data.encode() if isinstance(data, str) else data
+        length = len(payload)
+
+        if length < 126:
+            header = bytes([0x80 | opcode, length])
+        elif length < 0x10000:
+            header = bytes([0x80 | opcode, 126]) + struct.pack(">H", length)
+        else:
+            header = bytes([0x80 | opcode, 127]) + struct.pack(">Q", length)
+
+        self.sock.send(header + payload)
+
+    def close(self) -> None:
+        """Close the connection."""
+        self.sock.close()
 
 
 class WSMessage(SimpleNamespace):
@@ -139,22 +210,12 @@ class PluginProtocol(Protocol):
     def setup(self, app: App) -> None: ...
 
 
-@dataclass
-class Plugin:
-    """Base plugin class. Subclass and override setup()."""
-
-    name: str = "plugin"
-
-    def setup(self, app: App) -> None:
-        pass
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Type Aliases
 # ──────────────────────────────────────────────────────────────────────────────
 
 MiddlewareFn = Callable[[Request, Response], None]
-RouteHandler = Callable[[Request], Response | dict | None]
+RouteHandler = Callable[[Request], Response | dict[str, Any] | None]
 HookHandler = Callable[[Any], None]
 
 
@@ -229,7 +290,7 @@ class App:
                 return False
         return True
 
-    def route(self, method: str, path: str, req: Request) -> dict | None:
+    def route(self, method: str, path: str, req: Request) -> dict[str, Any] | None:
         """Find and execute a route handler."""
         handler = self._routes.get(method, {}).get(path)
         if not handler:
@@ -238,6 +299,16 @@ class App:
         if isinstance(result, SimpleNamespace):
             return vars(result)
         return result
+
+
+@dataclass
+class Plugin:
+    """Base plugin class. Subclass and override setup()."""
+
+    name: str = "plugin"
+
+    def setup(self, app: App) -> None:
+        pass
 
 
 # Global app instance and convenience decorators
@@ -267,14 +338,18 @@ def parse_query(path: str) -> tuple[str, dict[str, str]]:
 
 
 def make_request(
-    method: str, path: str, headers: dict, query: dict, body: Any = None
+    method: str,
+    path: str,
+    headers: dict[str, str],
+    query: dict[str, str],
+    body: Any = None,
 ) -> Request:
     """Create a Request object."""
     return Request(method=method, path=path, headers=headers, query=query, body=body)
 
 
 def make_response(
-    status: int = 200, body: Any = None, headers: dict = None
+    status: int = 200, body: Any = None, headers: dict[str, str] | None = None
 ) -> Response:
     """Create a Response object."""
     return Response(status=status, body=body or {}, headers=headers or {}, stop=False)
@@ -283,7 +358,7 @@ def make_response(
 class HTTPHandler(BaseHTTPRequestHandler):
     """HTTP request handler with middleware and routing support."""
 
-    def log_message(self, *_: Any) -> None:
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         pass
 
     def _serve_html(self, filepath: str) -> bool:
@@ -293,7 +368,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
                 content = f.read()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", len(content))
+            self.send_header("Content-Length", str(len(content)))
             self.end_headers()
             self.wfile.write(content)
             return True
@@ -306,7 +381,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
         for k, v in res.headers.items():
             self.send_header(k, v)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", len(body))
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
@@ -356,77 +431,6 @@ class HTTPHandler(BaseHTTPRequestHandler):
         self._handle("POST", body)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# WebSocket Client
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-@dataclass
-class WSClient:
-    """WebSocket client connection. Use 'data' namespace for per-connection state."""
-
-    sock: socket.socket
-    data: SimpleNamespace = field(default_factory=SimpleNamespace)
-
-    def handshake(self) -> None:
-        """Perform WebSocket handshake."""
-        req = self.sock.recv(1024)
-        key = next(
-            line.split(b": ", 1)[1]
-            for line in req.split(b"\r\n")
-            if line.lower().startswith(b"sec-websocket-key")
-        )
-        accept = b64encode(sha1(key + WS_MAGIC).digest())
-        self.sock.send(
-            b"HTTP/1.1 101 Switching Protocols\r\n"
-            b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
-            b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
-        )
-
-    def recv(self) -> tuple[int | None, bytes | None]:
-        """Receive a WebSocket frame. Returns (opcode, data)."""
-        header = self.sock.recv(2)
-        if len(header) < 2:
-            return None, None
-
-        opcode = header[0] & 0x0F
-        length = header[1] & 0x7F
-
-        if length == 126:
-            length = struct.unpack(">H", self.sock.recv(2))[0]
-        elif length == 127:
-            length = struct.unpack(">Q", self.sock.recv(8))[0]
-
-        if header[1] & 0x80:
-            mask = self.sock.recv(4)
-            payload = self.sock.recv(length)
-            data = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-        else:
-            data = self.sock.recv(length)
-
-        return opcode, data
-
-    def send(self, data: Any, opcode: int = 1) -> None:
-        """Send data over WebSocket. Auto-serializes dicts to JSON."""
-        if opcode == 1 and not isinstance(data, (str, bytes)):
-            data = json.dumps(data)
-        payload = data.encode() if isinstance(data, str) else data
-        length = len(payload)
-
-        if length < 126:
-            header = bytes([0x80 | opcode, length])
-        elif length < 0x10000:
-            header = bytes([0x80 | opcode, 126]) + struct.pack(">H", length)
-        else:
-            header = bytes([0x80 | opcode, 127]) + struct.pack(">Q", length)
-
-        self.sock.send(header + payload)
-
-    def close(self) -> None:
-        """Close the connection."""
-        self.sock.close()
-
-
 def handle_ws_connection(sock: socket.socket) -> None:
     """Handle a WebSocket connection lifecycle."""
     ws = WSClient(sock)
@@ -443,10 +447,10 @@ def handle_ws_connection(sock: socket.socket) -> None:
                 break
 
             if opcode == 9:
-                ws.send(data, 10)
+                ws.send(data or b"", 10)
                 continue
 
-            if opcode == 1:
+            if opcode == 1 and data is not None:
                 try:
                     msg = json.loads(data)
                     ctx = WSMessage(ws=ws, data=msg, reply=None, stop=False)
@@ -485,6 +489,17 @@ class Server:
     _ws: socket.socket | None = field(default=None, repr=False)
     _running: bool = field(default=False, repr=False)
 
+    def _ws_loop(self) -> None:
+        """Accept WebSocket connections."""
+        while self._running and self._ws is not None:
+            try:
+                sock, _ = self._ws.accept()
+                threading.Thread(
+                    target=handle_ws_connection, args=(sock,), daemon=True
+                ).start()
+            except TimeoutError:
+                pass
+
     def start(self) -> None:
         """Start both HTTP and WebSocket servers."""
         self._running = True
@@ -503,17 +518,6 @@ class Server:
             print(f"[WebSocket] -> ws://localhost:{self.ws_port}")
 
         print(f"[HTTP] -> http://localhost:{self.http_port}")
-
-    def _ws_loop(self) -> None:
-        """Accept WebSocket connections."""
-        while self._running:
-            try:
-                sock, _ = self._ws.accept()
-                threading.Thread(
-                    target=handle_ws_connection, args=(sock,), daemon=True
-                ).start()
-            except TimeoutError:
-                pass
 
     def stop(self) -> None:
         """Stop both servers."""
