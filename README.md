@@ -473,7 +473,7 @@ class MetricsPlugin(Plugin):
 
 Use `app.state` (a `SimpleNamespace`) for sharing data across handlers.
 
-### Basic Usage
+### Basic `State` Usage
 
 ```python
 from server import app
