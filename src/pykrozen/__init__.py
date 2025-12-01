@@ -26,6 +26,8 @@ __all__ = [
     # Request/Response
     "Request",
     "Response",
+    "ResponseDict",
+    "UploadedFile",
     # WebSocket
     "WSClient",
     "WSMessage",
@@ -43,10 +45,16 @@ __all__ = [
     # Factory functions
     "make_request",
     "make_response",
+    # Response helpers
+    "html",
+    "text",
+    "file",
+    "upload",
     # Type aliases
     "MiddlewareFn",
     "RouteHandler",
     "HookHandler",
+    "UploadHandler",
     "PluginProtocol",
 ]
 
@@ -61,7 +69,7 @@ from dataclasses import dataclass, field
 from hashlib import sha1
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
-from typing import Any, NamedTuple, Protocol
+from typing import Any, NamedTuple, Protocol, TypedDict
 
 WS_MAGIC = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -77,6 +85,44 @@ class Route(NamedTuple):
     method: str
     path: str
     handler: Callable[..., Any]
+
+
+class ResponseDict(TypedDict, total=False):
+    """TypedDict for route handler responses.
+
+    All fields are optional. Defaults:
+        - body: {} (empty dict, serialized as JSON)
+        - status: 200
+        - headers: {} (Content-Type defaults to application/json)
+
+    Example:
+        >>> @get("/page")
+        ... def page(req) -> ResponseDict:
+        ...     return {"body": "<h1>Hi</h1>", "headers": {"Content-Type": "text/html"}}
+        >>>
+        >>> @get("/api")
+        ... def api(req) -> ResponseDict:
+        ...     return {"body": {"message": "Hello"}, "status": 200}
+    """
+
+    body: Any  # Response body: dict/list (JSON), str, or bytes
+    status: int  # HTTP status code (default: 200)
+    headers: dict[str, str]  # Response headers. Set Content-Type to change format
+
+
+class UploadedFile(TypedDict):
+    """TypedDict representing an uploaded file.
+
+    Example:
+        >>> def handle_upload(files: list[UploadedFile]) -> ResponseDict:
+        ...     for f in files:
+        ...         print(f["filename"], len(f["content"]), "bytes")
+        ...     return {"body": {"uploaded": len(files)}}
+    """
+
+    filename: str  # Original filename from the upload
+    content_type: str  # MIME type of the file
+    content: bytes  # Raw file content as bytes
 
 
 class Request(SimpleNamespace):
@@ -215,8 +261,9 @@ class PluginProtocol(Protocol):
 # ──────────────────────────────────────────────────────────────────────────────
 
 MiddlewareFn = Callable[[Request, Response], None]
-RouteHandler = Callable[[Request], Response | dict[str, Any] | None]
+RouteHandler = Callable[[Request], Response | ResponseDict | None]
 HookHandler = Callable[[Any], None]
+UploadHandler = Callable[[list[UploadedFile]], ResponseDict]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -290,14 +337,14 @@ class App:
                 return False
         return True
 
-    def route(self, method: str, path: str, req: Request) -> dict[str, Any] | None:
+    def route(self, method: str, path: str, req: Request) -> ResponseDict | None:
         """Find and execute a route handler."""
         handler = self._routes.get(method, {}).get(path)
         if not handler:
             return None
         result = handler(req)
         if isinstance(result, SimpleNamespace):
-            return vars(result)
+            return dict(vars(result))  # type: ignore[return-value]
         return result
 
 
@@ -355,6 +402,198 @@ def make_response(
     return Response(status=status, body=body or {}, headers=headers or {}, stop=False)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Response Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+# MIME types for common file extensions
+MIME_TYPES: dict[str, str] = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+    ".webp": "image/webp",
+    ".pdf": "application/pdf",
+    ".txt": "text/plain; charset=utf-8",
+    ".xml": "application/xml; charset=utf-8",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+}
+
+
+def html(content: str, status: int = 200) -> ResponseDict:
+    """Create an HTML response.
+
+    Args:
+        content: HTML string to return.
+        status: HTTP status code (default: 200).
+
+    Returns:
+        ResponseDict with body, headers, and status.
+
+    Example:
+        >>> @get("/page")
+        ... def page(req):
+        ...     return html("<h1>Hello World</h1>")
+    """
+    return {
+        "body": content,
+        "headers": {"Content-Type": "text/html; charset=utf-8"},
+        "status": status,
+    }
+
+
+def text(content: str, status: int = 200) -> ResponseDict:
+    """Create a plain text response.
+
+    Args:
+        content: Text string to return.
+        status: HTTP status code (default: 200).
+
+    Returns:
+        ResponseDict with body, headers, and status.
+
+    Example:
+        >>> @get("/robots.txt")
+        ... def robots(req):
+        ...     return text("User-agent: *\\nDisallow:")
+    """
+    return {
+        "body": content,
+        "headers": {"Content-Type": "text/plain; charset=utf-8"},
+        "status": status,
+    }
+
+
+def file(
+    filepath: str, content_type: str | None = None, status: int = 200
+) -> ResponseDict:
+    """Create a file response by reading from disk.
+
+    Args:
+        filepath: Path to the file to serve.
+        content_type: MIME type (auto-detected from extension if not provided).
+        status: HTTP status code (default: 200).
+
+    Returns:
+        ResponseDict with body (bytes), headers, and status.
+        Returns 404 response if file not found.
+
+    Example:
+        >>> @get("/logo")
+        ... def logo(req):
+        ...     return file("static/logo.png")
+        >>>
+        >>> @get("/download")
+        ... def download(req):
+        ...     return file("data/report.pdf", "application/pdf")
+    """
+    try:
+        with open(filepath, "rb") as f:
+            content = f.read()
+    except FileNotFoundError:
+        return {"body": {"error": "File not found"}, "status": 404}
+
+    if content_type is None:
+        ext = os.path.splitext(filepath)[1].lower()
+        content_type = MIME_TYPES.get(ext, "application/octet-stream")
+
+    return {
+        "body": content,
+        "headers": {"Content-Type": content_type},
+        "status": status,
+    }
+
+
+def _parse_multipart(body: bytes, boundary: bytes) -> list[UploadedFile]:
+    """Parse multipart form data and extract files."""
+    files: list[UploadedFile] = []
+    parts = body.split(b"--" + boundary)
+
+    for part in parts:
+        if not part or part in (b"--\r\n", b"--", b"\r\n"):
+            continue
+
+        # Split headers from content
+        if b"\r\n\r\n" not in part:
+            continue
+
+        header_section, content = part.split(b"\r\n\r\n", 1)
+        content = content.rstrip(b"\r\n")
+
+        # Parse headers
+        headers: dict[str, str] = {}
+        for line in header_section.split(b"\r\n"):
+            if b": " in line:
+                key, val = line.split(b": ", 1)
+                headers[key.decode().lower()] = val.decode()
+
+        # Extract filename from Content-Disposition
+        disposition = headers.get("content-disposition", "")
+        if 'filename="' not in disposition:
+            continue
+
+        filename = disposition.split('filename="')[1].split('"')[0]
+        content_type = headers.get("content-type", "application/octet-stream")
+
+        files.append(
+            {
+                "filename": filename,
+                "content_type": content_type,
+                "content": content,
+            }
+        )
+
+    return files
+
+
+def upload(path: str, handler: UploadHandler) -> None:
+    """Register an upload endpoint that handles multipart file uploads.
+
+    Args:
+        path: URL path for the upload endpoint.
+        handler: Function that receives list of UploadedFile and returns ResponseDict.
+
+    Example:
+        >>> def save_files(files: list[UploadedFile]) -> ResponseDict:
+        ...     for f in files:
+        ...         with open(f"uploads/{f['filename']}", "wb") as out:
+        ...             out.write(f["content"])
+        ...     return {"body": {"uploaded": len(files)}}
+        >>>
+        >>> upload("/api/upload", save_files)
+    """
+
+    def upload_handler(req: Request) -> ResponseDict:
+        content_type = req.headers.get("Content-Type", "")
+        if "multipart/form-data" not in content_type:
+            return {"body": {"error": "Expected multipart/form-data"}, "status": 400}
+
+        # Extract boundary
+        if "boundary=" not in content_type:
+            return {"body": {"error": "Missing boundary"}, "status": 400}
+
+        boundary = content_type.split("boundary=")[1].strip().encode()
+        if not isinstance(req.body, bytes):
+            return {"body": {"error": "Invalid body"}, "status": 400}
+
+        files = _parse_multipart(req.body, boundary)
+        return handler(files)
+
+    app._routes["POST"][path] = upload_handler
+
+
 class HTTPHandler(BaseHTTPRequestHandler):
     """HTTP request handler with middleware and routing support."""
 
@@ -376,11 +615,18 @@ class HTTPHandler(BaseHTTPRequestHandler):
             return False
 
     def _respond(self, res: Response) -> None:
-        body = json.dumps(res.body).encode()
+        content_type = res.headers.get("Content-Type", "application/json")
+        if content_type == "application/json":
+            body = json.dumps(res.body).encode()
+        elif isinstance(res.body, bytes):
+            body = res.body
+        else:
+            body = str(res.body).encode()
         self.send_response(res.status)
         for k, v in res.headers.items():
-            self.send_header(k, v)
-        self.send_header("Content-Type", "application/json")
+            if k != "Content-Type":
+                self.send_header(k, v)
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -424,10 +670,17 @@ class HTTPHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
-        try:
-            body = json.loads(raw)
-        except (json.JSONDecodeError, ValueError):
-            body = raw.decode()
+        content_type = self.headers.get("Content-Type", "")
+
+        # Keep raw bytes for multipart uploads
+        if "multipart/form-data" in content_type:
+            body: Any = raw
+        else:
+            try:
+                body = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                body = raw.decode()
+
         self._handle("POST", body)
 
 
