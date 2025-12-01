@@ -1,7 +1,5 @@
 """
 Lightweight HTTP + WebSocket server with plugin system.
-
-Uses SimpleNamespace and NamedTuple for clean, extensible data structures.
 """
 
 from __future__ import annotations
