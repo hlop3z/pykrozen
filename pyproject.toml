@@ -1,0 +1,14 @@
+[project]
+name = "pykrozen"
+version = "0.1.0"
+description = "Lightweight HTTP + WebSocket Server (Development Use Only)"
+readme = "README.md"
+authors = [
+    { name = "hlop3z", email = "23062270+hlop3z@users.noreply.github.com" },
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -1,4 +1,4 @@
-# Lightweight HTTP + WebSocket Server
+# Lightweight HTTP + WebSocket Server (Development Use Only)
 
 A minimal, extensible HTTP and WebSocket server with plugin support. Zero external dependencies.
 
