@@ -68,6 +68,7 @@ __all__ = [
 ]
 
 import asyncio
+import contextlib
 import inspect
 import json
 import os
@@ -99,28 +100,36 @@ _CRLF = b"\r\n"
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Try to import orjson for faster JSON serialization (~2-3x speedup)
+_orjson: Any = None
 try:
-    import orjson as _orjson
+    import orjson as _orjson_module
+
+    _orjson = _orjson_module
 
     def _json_dumps(obj: Any) -> str:
-        return _orjson.dumps(obj).decode("utf-8")
+        result: str = _orjson.dumps(obj).decode("utf-8")
+        return result
 
     def _json_loads(data: bytes | str) -> Any:
         return _orjson.loads(data)
 
     _JSON_BACKEND = "orjson"
 except ImportError:
-    _orjson = None  # type: ignore[assignment]
 
     def _json_dumps(obj: Any) -> str:
         return json.dumps(obj, separators=(",", ":"))
 
-    _json_loads = json.loads
+    def _json_loads(data: bytes | str) -> Any:
+        return json.loads(data)
+
     _JSON_BACKEND = "json"
 
 # Try to import numpy for faster XOR masking (~10x speedup for large payloads)
+_np: Any = None
 try:
-    import numpy as _np
+    import numpy as _np_module
+
+    _np = _np_module
 
     def _xor_unmask_fast(payload: bytearray, mask: bytes) -> bytes:
         """Vectorized XOR unmask using numpy."""
@@ -132,7 +141,6 @@ try:
 
     _XOR_BACKEND = "numpy"
 except ImportError:
-    _np = None  # type: ignore[assignment]
 
     def _xor_unmask_fast(payload: bytearray, mask: bytes) -> bytes:
         """Pure Python XOR unmask (optimized)."""
@@ -146,12 +154,13 @@ except ImportError:
 
 
 # Try to import aiohttp for async HTTP server (~3-10x throughput improvement)
+_aiohttp_web: Any = None
 try:
-    import aiohttp.web as _aiohttp_web
+    import aiohttp.web as _aiohttp_web_module
 
+    _aiohttp_web = _aiohttp_web_module
     _ASYNC_BACKEND = "aiohttp"
 except ImportError:
-    _aiohttp_web = None  # type: ignore[assignment]
     _ASYNC_BACKEND = "threading"
 
 
@@ -168,6 +177,7 @@ def get_backends() -> dict[str, str]:
         {'json': 'json', 'xor': 'python', 'server': 'threading'}   # stdlib fallback
     """
     return {"json": _JSON_BACKEND, "xor": _XOR_BACKEND, "server": _ASYNC_BACKEND}
+
 
 # Pre-computed status lines for common codes
 _STATUS_LINES: dict[int, bytes] = {
@@ -537,7 +547,13 @@ class App:
     _router: RadixRouter = field(default_factory=RadixRouter)
     # Legacy routes dict for backwards compatibility
     _routes: dict[str, dict[str, RouteHandler]] = field(
-        default_factory=lambda: {"GET": {}, "POST": {}, "PUT": {}, "DELETE": {}, "PATCH": {}}
+        default_factory=lambda: {
+            "GET": {},
+            "POST": {},
+            "PUT": {},
+            "DELETE": {},
+            "PATCH": {},
+        }
     )
     _plugins: list[PluginProtocol] = field(default_factory=list)
     state: SimpleNamespace = field(default_factory=SimpleNamespace)
@@ -655,8 +671,13 @@ class App:
 
         result = match.handler(req)
         if isinstance(result, Response):
-            return {"status": result.status, "body": result.body, "headers": result.headers}
-        return result
+            return {
+                "status": result.status,
+                "body": result.body,
+                "headers": result.headers,
+            }
+        response: ResponseDict | None = result
+        return response
 
 
 @dataclass
@@ -980,7 +1001,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
             if k != "Content-Type":
                 self.send_header(k, v)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", len(body))
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
@@ -1128,6 +1149,215 @@ def handle_ws_connection(sock: socket.socket) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Async Server (aiohttp-based, optional)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class AsyncServer:
+    """Async HTTP + WebSocket server using aiohttp (if available).
+
+    Provides significantly better performance than the threaded server
+    by using a single event loop instead of thread-per-request.
+    """
+
+    @staticmethod
+    async def _handle_request(request: Any) -> Any:
+        """Handle HTTP request in async context."""
+        method = request.method
+        path_with_query = request.path_qs
+        path, query = parse_query(path_with_query)
+
+        # Parse body for POST requests
+        body: Any = None
+        if method == "POST":
+            content_type = request.headers.get("Content-Type", "")
+            if "multipart/form-data" in content_type:
+                body = await request.read()
+            else:
+                raw = await request.read()
+                try:
+                    body = _json_loads(raw) if raw else None
+                except (json.JSONDecodeError, ValueError):
+                    body = raw.decode() if raw else ""
+
+        # Create request/response context
+        req = Request(
+            method=method,
+            path=path,
+            headers=dict(request.headers),
+            query=query,
+            body=body,
+        )
+        res = Response(status=200, body={}, headers={}, stop=False)
+
+        # Run middleware
+        for mw in app._middleware:
+            mw(req, res)
+            if res.stop:
+                break
+
+        # Pre-hook
+        hook_key = _HTTP_HOOK_KEYS.get(method)
+        if not res.stop and hook_key:
+            hooks = app._hooks.get(hook_key)
+            if hooks:
+                ctx = HTTPContext(req, res)
+                for fn in hooks:
+                    fn(ctx)
+                    if res.stop:
+                        break
+
+        if not res.stop:
+            # Route lookup using radix tree router (supports :param and *wildcard)
+            match = app._router.match_new(method, path)
+            if match.matched and match.handler is not None:
+                # Attach extracted parameters to request
+                if match.params:
+                    req.params.update(match.params)
+
+                result = match.handler(req)
+                # Support async handlers natively
+                if inspect.iscoroutine(result):
+                    result = await result
+
+                if result:
+                    if isinstance(result, Response):
+                        result = {
+                            "status": result.status,
+                            "body": result.body,
+                            "headers": result.headers,
+                        }
+                    res.status = result.get("status", res.status)
+                    res.body = result.get("body", res.body)
+                    headers = result.get("headers")
+                    if headers:
+                        res.headers.update(headers)
+            elif not res.body:
+                res.body = {"method": method, "path": path}
+
+            # Post-hook
+            if hook_key:
+                after_hooks = app._hooks.get(hook_key + ":after")
+                if after_hooks:
+                    ctx = HTTPContext(req, res)
+                    for fn in after_hooks:
+                        fn(ctx)
+
+        # Build response
+        content_type = res.headers.get("Content-Type")
+        if content_type is None or content_type == "application/json":
+            body_bytes = _json_dumps(res.body).encode()
+            content_type = "application/json"
+        elif isinstance(res.body, bytes):
+            body_bytes = res.body
+        else:
+            body_bytes = str(res.body).encode()
+
+        response_headers = {**res.headers, "Content-Type": content_type}
+        return _aiohttp_web.Response(
+            status=res.status,
+            body=body_bytes,
+            headers=response_headers,
+        )
+
+    @staticmethod
+    async def _handle_websocket(
+        request: Any,
+    ) -> Any:
+        """Handle WebSocket connection in async context."""
+        ws_response = _aiohttp_web.WebSocketResponse()
+        await ws_response.prepare(request)
+
+        # Create a wrapper that mimics WSClient interface
+        class AsyncWSClient:
+            def __init__(self, ws: Any) -> None:
+                self._ws = ws
+                self.data = SimpleNamespace()
+
+            def send(self, data: Any, opcode: int = 1) -> None:
+                if opcode == 1 and not isinstance(data, (str, bytes)):
+                    data = _json_dumps(data)
+                # Schedule send in event loop
+                asyncio.create_task(
+                    self._ws.send_str(data)
+                    if isinstance(data, str)
+                    else self._ws.send_bytes(data)
+                )
+
+            def close(self) -> None:
+                asyncio.create_task(self._ws.close())
+
+        ws_client = AsyncWSClient(ws_response)
+        app.emit("ws:connect", WSContext(ws_client))  # type: ignore[arg-type]
+
+        try:
+            async for msg in ws_response:
+                if msg.type == _aiohttp_web.WSMsgType.TEXT:
+                    try:
+                        data = _json_loads(msg.data)
+                        ctx = WSMessage(ws=ws_client, data=data, reply=None, stop=False)  # type: ignore[arg-type]
+                        app.emit("ws:message", ctx)
+
+                        if ctx.stop:
+                            continue
+                        if ctx.reply is not None:
+                            ws_client.send(ctx.reply)
+                        else:
+                            ws_client.send({"echo": data})
+                    except (json.JSONDecodeError, ValueError):
+                        ws_client.send({"error": "invalid json"})
+                elif msg.type == _aiohttp_web.WSMsgType.CLOSE:
+                    break
+        except Exception:
+            pass
+        finally:
+            app.emit("ws:disconnect", WSContext(ws_client))  # type: ignore[arg-type]
+
+        return ws_response
+
+    @staticmethod
+    def run(port: int = 8000, ws: int = 8765, host: str = "127.0.0.1") -> None:
+        """Run the async server."""
+        if _aiohttp_web is None:
+            raise ImportError(
+                "aiohttp is required for AsyncServer. Install with: pip install aiohttp"
+            )
+
+        async def start_server() -> None:
+            aiohttp_app = _aiohttp_web.Application()
+
+            # Add routes - catch all HTTP methods
+            aiohttp_app.router.add_route("*", "/{path:.*}", AsyncServer._handle_request)
+
+            # Add WebSocket route
+            aiohttp_app.router.add_route("GET", "/ws", AsyncServer._handle_websocket)
+
+            runner = _aiohttp_web.AppRunner(aiohttp_app)
+            await runner.setup()
+
+            site = _aiohttp_web.TCPSite(runner, host, port)
+            await site.start()
+
+            print(f"[HTTP+WS Async] -> http://{host}:{port}")
+            print(f"[WebSocket] -> ws://{host}:{port}/ws")
+
+            app.emit("server:start", ServerContext(None))  # type: ignore[arg-type]
+
+            # Keep running
+            try:
+                while True:
+                    await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                app.emit("server:stop", ServerContext(None))  # type: ignore[arg-type]
+                await runner.cleanup()
+
+        with contextlib.suppress(KeyboardInterrupt):
+            asyncio.run(start_server())
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Server
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -1212,7 +1442,9 @@ class Server:
                 app.plugin(p)
 
         # Determine which server to use
-        should_use_async = use_async if use_async is not None else (_ASYNC_BACKEND == "aiohttp")
+        should_use_async = (
+            use_async if use_async is not None else (_ASYNC_BACKEND == "aiohttp")
+        )
 
         if should_use_async and _aiohttp_web is not None:
             # Use async aiohttp server
@@ -1228,203 +1460,3 @@ class Server:
                 pass
             finally:
                 server.stop()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Async Server (aiohttp-based, optional)
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-class AsyncServer:
-    """Async HTTP + WebSocket server using aiohttp (if available).
-
-    Provides significantly better performance than the threaded server
-    by using a single event loop instead of thread-per-request.
-    """
-
-    @staticmethod
-    async def _handle_request(request: _aiohttp_web.Request) -> _aiohttp_web.Response:
-        """Handle HTTP request in async context."""
-        method = request.method
-        path_with_query = request.path_qs
-        path, query = parse_query(path_with_query)
-
-        # Parse body for POST requests
-        body: Any = None
-        if method == "POST":
-            content_type = request.headers.get("Content-Type", "")
-            if "multipart/form-data" in content_type:
-                body = await request.read()
-            else:
-                try:
-                    raw = await request.read()
-                    body = _json_loads(raw) if raw else None
-                except (json.JSONDecodeError, ValueError):
-                    body = (await request.read()).decode() if raw else ""
-
-        # Create request/response context
-        req = Request(
-            method=method,
-            path=path,
-            headers=dict(request.headers),
-            query=query,
-            body=body,
-        )
-        res = Response(status=200, body={}, headers={}, stop=False)
-
-        # Run middleware
-        for mw in app._middleware:
-            mw(req, res)
-            if res.stop:
-                break
-
-        if not res.stop:
-            # Pre-hook
-            hook_key = _HTTP_HOOK_KEYS.get(method)
-            if hook_key:
-                hooks = app._hooks.get(hook_key)
-                if hooks:
-                    ctx = HTTPContext(req, res)
-                    for fn in hooks:
-                        fn(ctx)
-                        if res.stop:
-                            break
-
-        if not res.stop:
-            # Route lookup using radix tree router (supports :param and *wildcard)
-            match = app._router.match_new(method, path)
-            if match.matched and match.handler is not None:
-                # Attach extracted parameters to request
-                if match.params:
-                    req.params.update(match.params)
-
-                result = match.handler(req)
-                # Support async handlers natively
-                if inspect.iscoroutine(result):
-                    result = await result
-
-                if result:
-                    if isinstance(result, Response):
-                        result = {"status": result.status, "body": result.body, "headers": result.headers}
-                    res.status = result.get("status", res.status)
-                    res.body = result.get("body", res.body)
-                    headers = result.get("headers")
-                    if headers:
-                        res.headers.update(headers)
-            elif not res.body:
-                res.body = {"method": method, "path": path}
-
-            # Post-hook
-            if hook_key:
-                after_hooks = app._hooks.get(hook_key + ":after")
-                if after_hooks:
-                    ctx = HTTPContext(req, res)
-                    for fn in after_hooks:
-                        fn(ctx)
-
-        # Build response
-        content_type = res.headers.get("Content-Type")
-        if content_type is None or content_type == "application/json":
-            body_bytes = _json_dumps(res.body).encode()
-            content_type = "application/json"
-        elif isinstance(res.body, bytes):
-            body_bytes = res.body
-        else:
-            body_bytes = str(res.body).encode()
-
-        response_headers = {**res.headers, "Content-Type": content_type}
-        return _aiohttp_web.Response(
-            status=res.status,
-            body=body_bytes,
-            headers=response_headers,
-        )
-
-    @staticmethod
-    async def _handle_websocket(request: _aiohttp_web.Request) -> _aiohttp_web.WebSocketResponse:
-        """Handle WebSocket connection in async context."""
-        ws_response = _aiohttp_web.WebSocketResponse()
-        await ws_response.prepare(request)
-
-        # Create a wrapper that mimics WSClient interface
-        class AsyncWSClient:
-            def __init__(self, ws: _aiohttp_web.WebSocketResponse) -> None:
-                self._ws = ws
-                self.data = SimpleNamespace()
-
-            def send(self, data: Any, opcode: int = 1) -> None:
-                if opcode == 1 and not isinstance(data, (str, bytes)):
-                    data = _json_dumps(data)
-                # Schedule send in event loop
-                asyncio.create_task(self._ws.send_str(data) if isinstance(data, str) else self._ws.send_bytes(data))
-
-            def close(self) -> None:
-                asyncio.create_task(self._ws.close())
-
-        ws_client = AsyncWSClient(ws_response)
-        app.emit("ws:connect", WSContext(ws_client))  # type: ignore[arg-type]
-
-        try:
-            async for msg in ws_response:
-                if msg.type == _aiohttp_web.WSMsgType.TEXT:
-                    try:
-                        data = _json_loads(msg.data)
-                        ctx = WSMessage(ws=ws_client, data=data, reply=None, stop=False)  # type: ignore[arg-type]
-                        app.emit("ws:message", ctx)
-
-                        if ctx.stop:
-                            continue
-                        if ctx.reply is not None:
-                            ws_client.send(ctx.reply)
-                        else:
-                            ws_client.send({"echo": data})
-                    except (json.JSONDecodeError, ValueError):
-                        ws_client.send({"error": "invalid json"})
-                elif msg.type == _aiohttp_web.WSMsgType.CLOSE:
-                    break
-        except Exception:
-            pass
-        finally:
-            app.emit("ws:disconnect", WSContext(ws_client))  # type: ignore[arg-type]
-
-        return ws_response
-
-    @staticmethod
-    def run(port: int = 8000, ws: int = 8765, host: str = "127.0.0.1") -> None:
-        """Run the async server."""
-        if _aiohttp_web is None:
-            raise ImportError("aiohttp is required for AsyncServer. Install with: pip install aiohttp")
-
-        async def start_server() -> None:
-            aiohttp_app = _aiohttp_web.Application()
-
-            # Add routes - catch all HTTP methods
-            aiohttp_app.router.add_route("*", "/{path:.*}", AsyncServer._handle_request)
-
-            # Add WebSocket route
-            aiohttp_app.router.add_route("GET", "/ws", AsyncServer._handle_websocket)
-
-            runner = _aiohttp_web.AppRunner(aiohttp_app)
-            await runner.setup()
-
-            site = _aiohttp_web.TCPSite(runner, host, port)
-            await site.start()
-
-            print(f"[HTTP+WS Async] -> http://{host}:{port}")
-            print(f"[WebSocket] -> ws://{host}:{port}/ws")
-
-            app.emit("server:start", ServerContext(None))  # type: ignore[arg-type]
-
-            # Keep running
-            try:
-                while True:
-                    await asyncio.sleep(3600)
-            except asyncio.CancelledError:
-                pass
-            finally:
-                app.emit("server:stop", ServerContext(None))  # type: ignore[arg-type]
-                await runner.cleanup()
-
-        try:
-            asyncio.run(start_server())
-        except KeyboardInterrupt:
-            pass

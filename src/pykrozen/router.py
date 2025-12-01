@@ -6,7 +6,8 @@ Optimized for minimal allocations and fast path matching.
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 __all__ = ["RadixRouter", "RouteMatch", "RouteNode"]
 
@@ -19,8 +20,15 @@ NODE_WILDCARD = 2
 class RouteNode:
     """A node in the radix tree with __slots__ for performance."""
 
-    __slots__ = ('segment', 'node_type', 'param_name', 'static_children',
-                 'dynamic_child', 'wildcard_child', 'handlers')
+    __slots__ = (
+        "segment",
+        "node_type",
+        "param_name",
+        "static_children",
+        "dynamic_child",
+        "wildcard_child",
+        "handlers",
+    )
 
     def __init__(
         self,
@@ -40,7 +48,7 @@ class RouteNode:
 class RouteMatch:
     """Result of a successful route match."""
 
-    __slots__ = ('handler', 'params', 'matched')
+    __slots__ = ("handler", "params", "matched")
 
     def __init__(self) -> None:
         self.handler: Callable[..., Any] | None = None
@@ -57,7 +65,7 @@ class RouteMatch:
 class RadixRouter:
     """High-performance radix tree router."""
 
-    __slots__ = ('_trees', '_routes', '_match_cache', '_compiled')
+    __slots__ = ("_trees", "_routes", "_match_cache", "_compiled")
 
     def __init__(self) -> None:
         self._trees: dict[str, RouteNode] = {}
@@ -155,7 +163,9 @@ class RadixRouter:
         # Priority 1: Static match
         static_child = node.static_children.get(segment)
         if static_child is not None:
-            result = self._match_node(static_child, segments, next_idx, num_segments, params, method)
+            result = self._match_node(
+                static_child, segments, next_idx, num_segments, params, method
+            )
             if result is not None:
                 return result
 
@@ -164,7 +174,9 @@ class RadixRouter:
         if dyn is not None:
             param_name = dyn.param_name
             params[param_name] = segment
-            result = self._match_node(dyn, segments, next_idx, num_segments, params, method)
+            result = self._match_node(
+                dyn, segments, next_idx, num_segments, params, method
+            )
             if result is not None:
                 return result
             del params[param_name]  # Backtrack
@@ -212,7 +224,9 @@ class RadixRouter:
         segments = path_stripped.split("/")
 
         # Match using recursive function
-        handler = self._match_node(root, segments, 0, len(segments), match.params, method)
+        handler = self._match_node(
+            root, segments, 0, len(segments), match.params, method
+        )
         if handler is not None:
             match.handler = handler
             match.matched = True
@@ -250,7 +264,9 @@ class RadixRouter:
 
         segments = path_stripped.split("/")
 
-        handler = self._match_node(root, segments, 0, len(segments), match.params, method)
+        handler = self._match_node(
+            root, segments, 0, len(segments), match.params, method
+        )
         if handler is not None:
             match.handler = handler
             match.matched = True
@@ -261,15 +277,6 @@ class RadixRouter:
         """Get all registered routes."""
         return [(method, path) for method, path, _ in self._routes]
 
-    def print_tree(self, method: str | None = None) -> None:
-        """Print the routing tree for debugging."""
-        methods = [method] if method else list(self._trees.keys())
-        for m in methods:
-            if m not in self._trees:
-                continue
-            print(f"\n=== {m} Routes ===")
-            self._print_node(self._trees[m], "", True)
-
     def _print_node(self, node: RouteNode, prefix: str, is_last: bool) -> None:
         """Recursively print a node and its children."""
         connector = "`-- " if is_last else "|-- "
@@ -279,10 +286,14 @@ class RadixRouter:
                 type_indicator = " (param)"
             elif node.node_type == NODE_WILDCARD:
                 type_indicator = " (wildcard)"
-            handlers_str = f" [{', '.join(node.handlers.keys())}]" if node.handlers else ""
+            handlers_str = (
+                f" [{', '.join(node.handlers.keys())}]" if node.handlers else ""
+            )
             print(f"{prefix}{connector}{node.segment}{type_indicator}{handlers_str}")
         else:
-            handlers_str = f" [{', '.join(node.handlers.keys())}]" if node.handlers else ""
+            handlers_str = (
+                f" [{', '.join(node.handlers.keys())}]" if node.handlers else ""
+            )
             print(f"{prefix}{connector}(root){handlers_str}")
 
         children: list[tuple[str, RouteNode]] = []
@@ -296,6 +307,15 @@ class RadixRouter:
         child_prefix = prefix + ("    " if is_last else "|   ")
         for i, (_, child) in enumerate(children):
             self._print_node(child, child_prefix, i == len(children) - 1)
+
+    def print_tree(self, method: str | None = None) -> None:
+        """Print the routing tree for debugging."""
+        methods = [method] if method else list(self._trees.keys())
+        for m in methods:
+            if m not in self._trees:
+                continue
+            print(f"\n=== {m} Routes ===")
+            self._print_node(self._trees[m], "", True)
 
 
 def create_router() -> RadixRouter:
