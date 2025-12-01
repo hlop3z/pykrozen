@@ -60,7 +60,8 @@ from dataclasses import dataclass, field
 from hashlib import sha1
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
-from typing import Any, Callable, NamedTuple, Protocol
+from collections.abc import Callable
+from typing import Any, NamedTuple, Protocol
 
 WS_MAGIC = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -511,7 +512,7 @@ class Server:
                 threading.Thread(
                     target=handle_ws_connection, args=(sock,), daemon=True
                 ).start()
-            except socket.timeout:
+            except TimeoutError:
                 pass
 
     def stop(self) -> None:
