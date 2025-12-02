@@ -17,20 +17,20 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from pykrozen import (
-    Server,
-    get,
-    post,
-    on,
-    use,
-    html,
-    text,
-    upload,
-    UploadedFile,
-    ResponseDict,
     Request,
     Response,
+    ResponseDict,
+    Server,
+    UploadedFile,
     WSContext,
     WSMessage,
+    get,
+    html,
+    on,
+    post,
+    text,
+    upload,
+    use,
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -349,4 +349,4 @@ if __name__ == "__main__":
     print(f"  WebSocket: ws://{host}:{ws_port}")
     print("\nPress Ctrl+C to stop.\n")
 
-    Server.run(port=http_port, ws=ws_port, host=host)
+    Server.run()

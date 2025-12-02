@@ -798,10 +798,24 @@ class HTTPHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         pass
 
+    def log_error(self, format: str, *args: Any) -> None:  # noqa: A002
+        """Suppress error logging for cleaner output during stress testing."""
+        pass
+
+    def handle_one_request(self) -> None:
+        """Handle a single HTTP request, suppressing broken pipe errors."""
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+
     def finish(self) -> None:
         """Override finish to skip cleanup if WebSocket upgraded."""
         if not self._ws_upgraded:
-            super().finish()
+            try:
+                super().finish()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
 
     def _serve_html(self, filepath: str) -> bool:
         """Serve an HTML file, returns True if served."""
