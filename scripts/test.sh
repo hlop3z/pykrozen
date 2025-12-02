@@ -6,6 +6,10 @@
 
 set -e
 
+# Get the script directory and project root
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -102,14 +106,14 @@ echo -e "  HTTP Port:   ${YELLOW}$HTTP_PORT${NC}"
 echo -e "  WS Port:     ${YELLOW}$WS_PORT${NC}"
 echo ""
 
-# Check if we're in the right directory
-if [ ! -d "super-tests" ]; then
+# Check if super-tests directory exists
+if [ ! -d "$PROJECT_ROOT/super-tests" ]; then
     echo -e "${RED}Error: super-tests directory not found.${NC}"
-    echo "Please run this script from the pykrozen root directory."
+    echo "Expected at: $PROJECT_ROOT/super-tests"
     exit 1
 fi
 
-cd super-tests
+cd "$PROJECT_ROOT/super-tests"
 
 # Check if Rust tester is built
 TESTER_BIN="target/release/super-tests"
@@ -138,10 +142,10 @@ echo ""
 
 EXIT_CODE=$?
 
-cd ..
+cd "$PROJECT_ROOT"
 
 # Find and display the report in performance folder
-REPORT=$(ls -t super-tests/performance/performance_report_*.md 2>/dev/null | head -1)
+REPORT=$(ls -t "$PROJECT_ROOT/super-tests/performance/performance_report_*.md" 2>/dev/null | head -1)
 if [ -n "$REPORT" ]; then
     echo ""
     echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"

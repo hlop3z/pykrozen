@@ -237,6 +237,8 @@ class WSClient:
 
     sock: socket.socket
     data: SimpleNamespace = field(default_factory=SimpleNamespace)
+    _send_lock: threading.Lock = field(default_factory=threading.Lock)
+    _recv_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def _send_handshake_response(self, key: bytes) -> None:
         accept = b64encode(sha1(key + WS_MAGIC).digest())
@@ -260,53 +262,64 @@ class WSClient:
         """Perform WebSocket handshake with pre-parsed key."""
         self._send_handshake_response(key.encode())
 
+    def _recv_exact(self, n: int) -> bytes:
+        """Read exactly n bytes from socket, handling partial reads."""
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("Connection closed")
+            buf.extend(chunk)
+        return bytes(buf)
+
     def recv(self) -> tuple[int | None, bytes | None]:
         """Receive a WebSocket frame, returns (opcode, data)."""
-        header = self.sock.recv(2)
-        if len(header) < 2:
-            return None, None
+        with self._recv_lock:
+            try:
+                header = self._recv_exact(2)
 
-        opcode = header[0] & 0x0F
-        length = header[1] & 0x7F
+                opcode = header[0] & 0x0F
+                length = header[1] & 0x7F
 
-        if length == 126:
-            length = struct.unpack(">H", self.sock.recv(2))[0]
-        elif length == 127:
-            length = struct.unpack(">Q", self.sock.recv(8))[0]
+                if length == 126:
+                    length = struct.unpack(">H", self._recv_exact(2))[0]
+                elif length == 127:
+                    length = struct.unpack(">Q", self._recv_exact(8))[0]
 
-        if header[1] & 0x80:
-            mask = self.sock.recv(4)
-            # Read payload in chunks for large messages
-            payload = bytearray()
-            remaining = length
-            while remaining > 0:
-                chunk = self.sock.recv(min(remaining, 65536))
-                if not chunk:
-                    break
-                payload.extend(chunk)
-                remaining -= len(chunk)
-            # XOR unmask (uses numpy if available, else optimized pure Python)
-            data = _xor_unmask_fast(payload, mask)
-        else:
-            data = self.sock.recv(length)
+                if header[1] & 0x80:
+                    mask = self._recv_exact(4)
+                    # Read payload using exact reads to handle TCP fragmentation
+                    payload = self._recv_exact(length) if length > 0 else b""
+                    # XOR unmask
+                    data = _xor_unmask_fast(bytearray(payload), mask)
+                else:
+                    data = self._recv_exact(length) if length > 0 else b""
 
-        return opcode, data
+                return opcode, data
+            except (ConnectionError, OSError, struct.error):
+                return None, None
 
-    def send(self, data: Any, opcode: int = WSOpcode.TEXT) -> None:
+    def send(self, data: Any, opcode: int = WSOpcode.TEXT) -> bool:
         """Send data over WebSocket (auto-serializes dicts to JSON)."""
-        if opcode == WSOpcode.TEXT and not isinstance(data, (str, bytes)):
-            data = _json_dumps(data)
-        payload = data.encode() if isinstance(data, str) else data
-        length = len(payload)
+        with self._send_lock:
+            try:
+                if opcode == WSOpcode.TEXT and not isinstance(data, (str, bytes)):
+                    data = _json_dumps(data)
+                payload = data.encode() if isinstance(data, str) else data
+                length = len(payload)
 
-        if length < 126:
-            header = bytes([0x80 | opcode, length])
-        elif length < 0x10000:
-            header = bytes([0x80 | opcode, 126]) + struct.pack(">H", length)
-        else:
-            header = bytes([0x80 | opcode, 127]) + struct.pack(">Q", length)
+                if length < 126:
+                    header = bytes([0x80 | opcode, length])
+                elif length < 0x10000:
+                    header = bytes([0x80 | opcode, 126]) + struct.pack(">H", length)
+                else:
+                    header = bytes([0x80 | opcode, 127]) + struct.pack(">Q", length)
 
-        self.sock.send(header + payload)
+                # Use sendall to ensure complete transmission
+                self.sock.sendall(header + payload)
+                return True
+            except (OSError, BrokenPipeError, ConnectionError):
+                return False
 
     def close(self) -> None:
         """Close the connection."""
@@ -779,8 +792,16 @@ class HTTPHandler(BaseHTTPRequestHandler):
     rbufsize = 65536
     wbufsize = 65536
 
+    # Flag to prevent close after WebSocket upgrade
+    _ws_upgraded = False
+
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         pass
+
+    def finish(self) -> None:
+        """Override finish to skip cleanup if WebSocket upgraded."""
+        if not self._ws_upgraded:
+            super().finish()
 
     def _serve_html(self, filepath: str) -> bool:
         """Serve an HTML file, returns True if served."""
@@ -902,12 +923,10 @@ class HTTPHandler(BaseHTTPRequestHandler):
             if upgrade == "websocket":
                 ws_key = self.headers.get("Sec-WebSocket-Key")
                 if ws_key:
-                    sock = self.connection
-                    threading.Thread(
-                        target=handle_ws_upgrade,
-                        args=(sock, ws_key),
-                        daemon=True,
-                    ).start()
+                    # Mark as upgraded to prevent HTTP cleanup
+                    self._ws_upgraded = True
+                    # Handle WebSocket on this thread (blocking)
+                    handle_ws_upgrade(self.connection, ws_key)
                     return
 
         # Serve index.html on root path
