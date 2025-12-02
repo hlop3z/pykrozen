@@ -113,14 +113,34 @@ def _json_dumps(obj: Any) -> str:
     return json.dumps(obj, separators=(",", ":"))
 
 
+# Pre-allocated byte arrays for common operations (buffer pooling pattern from Rust)
+_BUFFER_POOL_SIZE = 32
+_buffer_pool: list[bytearray] = [bytearray(4096) for _ in range(_BUFFER_POOL_SIZE)]
+_buffer_pool_lock = threading.Lock()
+_buffer_pool_index = 0
+
+
+def _get_pooled_buffer(size: int = 4096) -> bytearray:
+    """Get a buffer from the pool or create new one (Rust buffer pooling pattern)."""
+    global _buffer_pool_index
+    if size <= 4096:
+        with _buffer_pool_lock:
+            buf = _buffer_pool[_buffer_pool_index]
+            _buffer_pool_index = (_buffer_pool_index + 1) % _BUFFER_POOL_SIZE
+            return buf
+    return bytearray(size)
+
+
 # Pre-encoded common responses to avoid repeated serialization
 _CACHED_RESPONSES: dict[str, bytes] = {}
+_CACHE_MAX_SIZE = 2000
+_CACHE_MAX_ITEM_SIZE = 512
 
 
 def _json_dumps_cached(obj: Any) -> bytes:
-    """JSON encode with caching for common small objects."""
+    """JSON encode with caching for common small objects (LRU-style)."""
     # Only cache small, hashable objects
-    if isinstance(obj, dict) and len(obj) <= 3:
+    if isinstance(obj, dict) and len(obj) <= 5:
         try:
             # Create a hashable key from the dict
             key = str(sorted(obj.items()))
@@ -128,8 +148,14 @@ def _json_dumps_cached(obj: Any) -> bytes:
             if cached is not None:
                 return cached
             result = json.dumps(obj, separators=(",", ":")).encode()
-            # Only cache if small
-            if len(result) < 256 and len(_CACHED_RESPONSES) < 1000:
+            # Only cache if small enough
+            if len(result) < _CACHE_MAX_ITEM_SIZE:
+                # Simple cache eviction: clear half when full
+                if len(_CACHED_RESPONSES) >= _CACHE_MAX_SIZE:
+                    # Keep newest half (Python 3.7+ dicts maintain insertion order)
+                    keys = list(_CACHED_RESPONSES.keys())
+                    for k in keys[:len(keys) // 2]:
+                        del _CACHED_RESPONSES[k]
                 _CACHED_RESPONSES[key] = result
             return result
         except (TypeError, ValueError):
@@ -405,22 +431,35 @@ class WSClient:
 class AsyncWSClient:
     """Async WebSocket client that works with asyncio transports."""
 
-    __slots__ = ("transport", "data", "_buffer", "_send_lock")
+    __slots__ = ("transport", "data", "_buffer", "_send_lock", "_data_event", "_closed")
 
     def __init__(self, transport: asyncio.Transport) -> None:
         self.transport = transport
         self.data: SimpleNamespace = SimpleNamespace()
         self._buffer = bytearray()
         self._send_lock = asyncio.Lock()
+        self._data_event: asyncio.Event = asyncio.Event()
+        self._closed = False
+
+    async def _wait_for_bytes(self, n: int) -> bool:
+        """Wait for at least n bytes in buffer using event-driven approach."""
+        while len(self._buffer) < n:
+            if self._closed or not self.transport or self.transport.is_closing():
+                return False
+            self._data_event.clear()
+            # Use wait_for with short timeout to check connection state
+            try:
+                await asyncio.wait_for(self._data_event.wait(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue
+        return True
 
     async def recv_async(self) -> tuple[int | None, bytes | None]:
-        """Receive a WebSocket frame asynchronously."""
+        """Receive a WebSocket frame asynchronously (event-driven, no polling)."""
         try:
-            # Wait for at least 2 bytes (header)
-            while len(self._buffer) < 2:
-                await asyncio.sleep(0.001)  # Yield to event loop
-                if not self.transport or self.transport.is_closing():
-                    return None, None
+            # Wait for header (2 bytes)
+            if not await self._wait_for_bytes(2):
+                return None, None
 
             header = bytes(self._buffer[:2])
             opcode = header[0] & 0x0F
@@ -429,17 +468,13 @@ class AsyncWSClient:
 
             # Extended length
             if length == 126:
-                while len(self._buffer) < offset + 2:
-                    await asyncio.sleep(0.001)
-                    if not self.transport or self.transport.is_closing():
-                        return None, None
+                if not await self._wait_for_bytes(offset + 2):
+                    return None, None
                 length = struct.unpack(">H", bytes(self._buffer[offset:offset + 2]))[0]
                 offset += 2
             elif length == 127:
-                while len(self._buffer) < offset + 8:
-                    await asyncio.sleep(0.001)
-                    if not self.transport or self.transport.is_closing():
-                        return None, None
+                if not await self._wait_for_bytes(offset + 8):
+                    return None, None
                 length = struct.unpack(">Q", bytes(self._buffer[offset:offset + 8]))[0]
                 offset += 8
 
@@ -447,18 +482,14 @@ class AsyncWSClient:
             masked = header[1] & 0x80
             mask = b""
             if masked:
-                while len(self._buffer) < offset + 4:
-                    await asyncio.sleep(0.001)
-                    if not self.transport or self.transport.is_closing():
-                        return None, None
+                if not await self._wait_for_bytes(offset + 4):
+                    return None, None
                 mask = bytes(self._buffer[offset:offset + 4])
                 offset += 4
 
             # Payload
-            while len(self._buffer) < offset + length:
-                await asyncio.sleep(0.001)
-                if not self.transport or self.transport.is_closing():
-                    return None, None
+            if not await self._wait_for_bytes(offset + length):
+                return None, None
 
             payload = bytes(self._buffer[offset:offset + length])
             del self._buffer[:offset + length]
@@ -472,8 +503,14 @@ class AsyncWSClient:
             return None, None
 
     def feed_data(self, data: bytes) -> None:
-        """Feed received data into buffer."""
+        """Feed received data into buffer and signal waiting coroutines."""
         self._buffer.extend(data)
+        self._data_event.set()
+
+    def mark_closed(self) -> None:
+        """Mark connection as closed."""
+        self._closed = True
+        self._data_event.set()  # Wake up any waiting recv
 
     def send(self, data: Any, opcode: int = WSOpcode.TEXT) -> bool:
         """Send data over WebSocket."""
@@ -1206,6 +1243,17 @@ _HTTP_STATUS: dict[int, str] = {
     500: "Internal Server Error",
 }
 
+# Pre-built response headers (Actix/Hyper pattern - avoid string formatting per request)
+_PREBUILT_HEADERS: dict[int, bytes] = {
+    status: f"HTTP/1.1 {status} {text}\r\n".encode()
+    for status, text in _HTTP_STATUS.items()
+}
+
+# Pre-built common header lines
+_HEADER_JSON = b"Content-Type: application/json\r\n"
+_HEADER_KEEPALIVE = b"Connection: keep-alive\r\n"
+_HEADER_CLOSE = b"Connection: close\r\n"
+
 
 class AsyncHTTPProtocol(asyncio.Protocol):
     """High-performance asyncio HTTP protocol handler."""
@@ -1222,10 +1270,17 @@ class AsyncHTTPProtocol(asyncio.Protocol):
 
     def connection_made(self, transport: asyncio.Transport) -> None:
         self.transport = transport
-        # Disable Nagle's algorithm
+        # Socket optimizations (Gunicorn/uWSGI patterns)
         sock = transport.get_extra_info("socket")
         if sock:
+            # Disable Nagle's algorithm for lower latency
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            # Increase socket buffers for throughput (64KB is optimal balance)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+            except OSError:
+                pass  # Not all platforms support buffer resizing
 
     def connection_lost(self, exc: Exception | None) -> None:
         self.transport = None
@@ -1325,6 +1380,7 @@ class AsyncHTTPProtocol(asyncio.Protocol):
         except (ConnectionResetError, BrokenPipeError, OSError, asyncio.CancelledError):
             pass
         finally:
+            ws.mark_closed()
             self._ws_mode = False
             self._ws_client = None
             app.emit("ws:disconnect", WSContext(ws))
@@ -1441,37 +1497,53 @@ class AsyncHTTPProtocol(asyncio.Protocol):
         self._send_response(res)
 
     def _send_response(self, res: Response) -> None:
-        """Send HTTP response."""
+        """Send HTTP response using pre-built headers for speed."""
         if not self.transport:
             return
 
         # Serialize body
         content_type = res.headers.get("Content-Type")
-        if content_type is None:
+        is_json = content_type is None or content_type == CONTENT_TYPE_JSON
+        if is_json:
             body = _json_dumps_cached(res.body)
             content_type = CONTENT_TYPE_JSON
-        elif content_type == CONTENT_TYPE_JSON:
-            body = _json_dumps_cached(res.body)
         elif isinstance(res.body, bytes):
             body = res.body
         else:
             body = str(res.body).encode()
 
-        # Build response
-        status_text = _HTTP_STATUS.get(res.status, "OK")
-        headers_list = [f"HTTP/1.1 {res.status} {status_text}"]
-        headers_list.append(f"Content-Type: {content_type}")
-        headers_list.append(f"Content-Length: {len(body)}")
+        # Fast path: use pre-built status line if available
+        status_line = _PREBUILT_HEADERS.get(res.status)
+        if status_line is None:
+            status_text = _HTTP_STATUS.get(res.status, "OK")
+            status_line = f"HTTP/1.1 {res.status} {status_text}\r\n".encode()
 
+        # Build response using bytes concatenation (faster than string join)
+        parts = [status_line]
+
+        # Content-Type header
+        if is_json:
+            parts.append(_HEADER_JSON)
+        else:
+            parts.append(f"Content-Type: {content_type}\r\n".encode())
+
+        # Content-Length
+        parts.append(f"Content-Length: {len(body)}\r\n".encode())
+
+        # Custom headers
         for k, v in res.headers.items():
             if k != "Content-Type":
-                headers_list.append(f"{k}: {v}")
+                parts.append(f"{k}: {v}\r\n".encode())
 
-        if self.keep_alive:
-            headers_list.append("Connection: keep-alive")
+        # Connection header
+        parts.append(_HEADER_KEEPALIVE if self.keep_alive else _HEADER_CLOSE)
 
-        response = "\r\n".join(headers_list) + "\r\n\r\n"
-        self.transport.write(response.encode() + body)
+        # End headers and body
+        parts.append(b"\r\n")
+        parts.append(body)
+
+        # Single write call (more efficient than multiple writes)
+        self.transport.write(b"".join(parts))
 
     def _send_error(self, status: int) -> None:
         """Send error response."""

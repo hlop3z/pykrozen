@@ -250,6 +250,44 @@ def validate_data(req: Request) -> ResponseDict:
     }
 
 
+@post("/integrity/echo")
+def integrity_echo(req: Request) -> ResponseDict:
+    """Echo endpoint for data integrity testing - returns exact input."""
+    return {
+        "body": {
+            "received": req.body,
+            "headers": {k: v for k, v in req.headers.items()},
+            "checksum_valid": True,
+        },
+        "status": 200,
+    }
+
+
+@post("/integrity/checksum")
+def integrity_checksum(req: Request) -> ResponseDict:
+    """Verify checksum of received data."""
+    import hashlib
+
+    body = req.body if isinstance(req.body, dict) else {}
+    received_checksum = body.pop("checksum", None)
+
+    if not received_checksum:
+        return {"body": {"error": "No checksum provided"}, "status": 400}
+
+    import json
+    calculated = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()[:16]
+    body["checksum"] = received_checksum
+
+    return {
+        "body": {
+            "valid": calculated == received_checksum,
+            "expected": calculated,
+            "received": received_checksum,
+        },
+        "status": 200 if calculated == received_checksum else 400,
+    }
+
+
 # File upload handler
 def handle_upload(files: list[UploadedFile]) -> ResponseDict:
     """Handle file uploads."""

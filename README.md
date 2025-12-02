@@ -31,7 +31,6 @@ Server.run()
 - [Shared State](#shared-state)
 - [Type Reference](#type-reference)
 - [Performance](#performance)
-- [Running Behind a Reverse Proxy](#running-behind-a-reverse-proxy)
 
 ---
 
@@ -312,21 +311,6 @@ def broadcast(message: dict) -> None:
         client.send(message)
 ```
 
-### Client Connection (JavaScript)
-
-```javascript
-// Connect to WebSocket at configured path
-const ws = new WebSocket("ws://localhost:8000/ws");
-
-ws.onopen = () => {
-  ws.send(JSON.stringify({ type: "ping" }));
-};
-
-ws.onmessage = (event) => {
-  console.log(JSON.parse(event.data));
-};
-```
-
 ---
 
 ## Plugins
@@ -560,22 +544,6 @@ settings.debug = True  # See worker startup messages
 Server.run()
 ```
 
-Each worker runs its own HTTP server and the kernel load-balances connections between them. This is similar to how Gunicorn or uWSGI work.
+Each worker runs its own HTTP server and the kernel load-balances connections between them.
 
 > **Note:** Multi-worker mode is only available on Unix/Linux due to `SO_REUSEPORT` requirements. On Windows, the server runs in single-process threaded mode.
-
----
-
-## Running Behind a Reverse Proxy
-
-Pykrozen is designed to run behind a reverse proxy like Caddy or Nginx. The proxy handles TLS, HTTP/2, rate limiting, and other security concerns.
-
-### Caddy Example
-
-```caddyfile
-example.com {
-    reverse_proxy localhost:8000
-}
-```
-
-Caddy automatically handles HTTP/2 and HTTP/3 for HTTPS connections.
