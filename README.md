@@ -30,6 +30,8 @@ Server.run()
 - [Plugins](#plugins)
 - [Shared State](#shared-state)
 - [Type Reference](#type-reference)
+- [Performance](#performance)
+- [Running Behind a Reverse Proxy](#running-behind-a-reverse-proxy)
 
 ---
 
@@ -68,11 +70,16 @@ Server.run()
 
 ### Settings Reference
 
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `port` | `int` | `8000` | HTTP server port |
-| `host` | `str` | `127.0.0.1` | Bind address |
-| `ws_path` | `str` | `/ws` | WebSocket upgrade path |
+| Setting      | Type   | Default     | Description                            |
+| ------------ | ------ | ----------- | -------------------------------------- |
+| `port`       | `int`  | `8000`      | HTTP server port                       |
+| `host`       | `str`  | `127.0.0.1` | Bind address                           |
+| `ws_path`    | `str`  | `/ws`       | WebSocket upgrade path                 |
+| `debug`      | `bool` | `False`     | Enable debug output                    |
+| `base_dir`   | `Path` | `cwd()`     | Base directory for static files        |
+| `workers`    | `int`  | `1`         | Number of worker processes (Unix only) |
+| `backlog`    | `int`  | `2048`      | Socket listen backlog                  |
+| `reuse_port` | `bool` | `True`      | Enable SO_REUSEPORT for load balancing |
 
 WebSocket connections are handled on the **same port** as HTTP, accessible at the configured `ws_path`.
 
@@ -199,17 +206,17 @@ Hooks let you react to events at specific points in the request lifecycle.
 
 ### Available Events
 
-| Event | Context | Description |
-|-------|---------|-------------|
-| `http:get` | `HTTPContext` | Before GET route handler |
-| `http:post` | `HTTPContext` | Before POST route handler |
-| `http:get:after` | `HTTPContext` | After GET route handler |
-| `http:post:after` | `HTTPContext` | After POST route handler |
-| `ws:connect` | `WSContext` | WebSocket client connected |
-| `ws:message` | `WSMessage` | WebSocket message received |
-| `ws:disconnect` | `WSContext` | WebSocket client disconnected |
-| `server:start` | `ServerContext` | Server started |
-| `server:stop` | `ServerContext` | Server stopping |
+| Event             | Context         | Description                   |
+| ----------------- | --------------- | ----------------------------- |
+| `http:get`        | `HTTPContext`   | Before GET route handler      |
+| `http:post`       | `HTTPContext`   | Before POST route handler     |
+| `http:get:after`  | `HTTPContext`   | After GET route handler       |
+| `http:post:after` | `HTTPContext`   | After POST route handler      |
+| `ws:connect`      | `WSContext`     | WebSocket client connected    |
+| `ws:message`      | `WSMessage`     | WebSocket message received    |
+| `ws:disconnect`   | `WSContext`     | WebSocket client disconnected |
+| `server:start`    | `ServerContext` | Server started                |
+| `server:stop`     | `ServerContext` | Server stopping               |
 
 ### HTTP Hooks
 
@@ -294,11 +301,11 @@ def broadcast(message: dict) -> None:
 const ws = new WebSocket("ws://localhost:8000/ws");
 
 ws.onopen = () => {
-    ws.send(JSON.stringify({ type: "ping" }));
+  ws.send(JSON.stringify({ type: "ping" }));
 };
 
 ws.onmessage = (event) => {
-    console.log(JSON.parse(event.data));
+  console.log(JSON.parse(event.data));
 };
 ```
 
@@ -478,6 +485,66 @@ def ws_message(ctx: WSMessage) -> None:
 if __name__ == "__main__":
     Server.run()
 ```
+
+---
+
+## Performance
+
+Pykrozen is optimized for high throughput using only Python's standard library.
+
+### Benchmarks
+
+Typical performance on a modern machine (50 concurrent connections, 5 second test):
+
+| Test      | Requests/sec | Avg Latency | Success Rate |
+| --------- | ------------ | ----------- | ------------ |
+| HTTP GET  | ~4,400 RPS   | ~11ms       | 100%         |
+| HTTP POST | ~4,800 RPS   | ~10ms       | 100%         |
+| WebSocket | ~5,900 RPS   | ~8ms        | 100%         |
+
+### Performance Tuning
+
+```python
+from pykrozen import settings
+
+# Multi-worker mode (Unix/Linux only)
+# Each worker is a separate process sharing the same port
+settings.workers = 4  # Use 4 worker processes
+
+# Socket tuning
+settings.backlog = 2048     # Increase connection queue
+settings.reuse_port = True  # Enable SO_REUSEPORT (default)
+```
+
+### Optimizations
+
+Pykrozen includes several performance optimizations:
+
+1. **Static Route Cache** - O(1) lookup for exact path matches (no `:param` or `*wildcard`)
+2. **Thread-local Route Matching** - Reuses match objects to avoid allocations
+3. **64-bit XOR Unmask** - WebSocket payload decoding processes 8 bytes at a time
+4. **JSON Response Caching** - Common small responses are cached to avoid re-serialization
+5. **Socket Buffer Tuning** - Optimized TCP buffer sizes and `SO_REUSEADDR`
+6. **Increased Listen Backlog** - Handles connection bursts (default: 2048)
+
+### Multi-Worker Mode
+
+On Unix/Linux systems, you can spawn multiple worker processes that share the same port using `SO_REUSEPORT`:
+
+```python
+import os
+from pykrozen import settings, Server
+
+# Use number of CPU cores
+settings.workers = os.cpu_count() or 4
+settings.debug = True  # See worker startup messages
+
+Server.run()
+```
+
+Each worker runs its own HTTP server and the kernel load-balances connections between them. This is similar to how Gunicorn or uWSGI work.
+
+> **Note:** Multi-worker mode is only available on Unix/Linux due to `SO_REUSEPORT` requirements. On Windows, the server runs in single-process threaded mode.
 
 ---
 

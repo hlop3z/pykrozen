@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import multiprocessing
 import os
 import socket
 import struct
+import sys
 import threading
 from base64 import b64encode
 from collections.abc import Callable, Coroutine
@@ -20,6 +22,9 @@ from types import SimpleNamespace
 from typing import Any, NamedTuple, Protocol, TypedDict
 
 from pykrozen.router import RadixRouter, RouteMatch
+
+# Platform-specific socket option (Unix only)
+SO_REUSEPORT: int | None = getattr(socket, "SO_REUSEPORT", None)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Enums and Constants
@@ -59,13 +64,38 @@ CONTENT_TYPE_OCTET = "application/octet-stream"
 
 @dataclass
 class Settings:
-    """Global server configuration. Modify before calling `Server.run()`."""
+    """Global server configuration. Modify before calling `Server.run()`.
+
+    Basic Settings:
+        port: HTTP server port (default: 8000)
+        host: Bind address (default: 127.0.0.1)
+        ws_path: WebSocket upgrade path (default: /ws)
+        debug: Enable debug output (default: False)
+        base_dir: Base directory for static files (default: cwd)
+
+    Performance Settings:
+        workers: Number of worker processes. Set >1 for multi-process mode
+                 on Unix/Linux. Uses SO_REUSEPORT for kernel load balancing.
+                 (default: 1, single-process mode)
+        backlog: Socket listen backlog for pending connections (default: 2048)
+        reuse_port: Enable SO_REUSEPORT socket option (default: True)
+
+    Example:
+        >>> from pykrozen import settings, Server
+        >>> settings.port = 3000
+        >>> settings.workers = 4  # Unix only
+        >>> Server.run()
+    """
 
     port: int = 8000
     host: str = "127.0.0.1"
     ws_path: str = "/ws"
     debug: bool = False
     base_dir: Path = Path.cwd()
+    # Performance settings
+    workers: int = 1  # Number of worker processes (1 = single process)
+    backlog: int = 2048  # Socket listen backlog
+    reuse_port: bool = True  # Enable SO_REUSEPORT for load balancing
 
 
 # Global settings instance
@@ -81,14 +111,57 @@ def _json_dumps(obj: Any) -> str:
     return json.dumps(obj, separators=(",", ":"))
 
 
+# Pre-encoded common responses to avoid repeated serialization
+_CACHED_RESPONSES: dict[str, bytes] = {}
+
+
+def _json_dumps_cached(obj: Any) -> bytes:
+    """JSON encode with caching for common small objects."""
+    # Only cache small, hashable objects
+    if isinstance(obj, dict) and len(obj) <= 3:
+        try:
+            # Create a hashable key from the dict
+            key = str(sorted(obj.items()))
+            cached = _CACHED_RESPONSES.get(key)
+            if cached is not None:
+                return cached
+            result = json.dumps(obj, separators=(",", ":")).encode()
+            # Only cache if small
+            if len(result) < 256 and len(_CACHED_RESPONSES) < 1000:
+                _CACHED_RESPONSES[key] = result
+            return result
+        except (TypeError, ValueError):
+            pass
+    return json.dumps(obj, separators=(",", ":")).encode()
+
+
 def _json_loads(data: bytes | str) -> Any:
     return json.loads(data)
 
 
 def _xor_unmask_fast(payload: bytearray, mask: bytes) -> bytes:
-    """Pure Python XOR unmask."""
-    for i in range(len(payload)):
-        payload[i] ^= mask[i & 3]
+    """Optimized XOR unmask using 64-bit operations where possible."""
+    length = len(payload)
+    if length == 0:
+        return b""
+
+    # Build 8-byte mask by repeating 4-byte mask twice
+    mask8 = mask * 2
+    mask_int = int.from_bytes(mask8, "little")
+
+    # Process 8 bytes at a time
+    i = 0
+    chunks = length // 8
+    for _ in range(chunks):
+        chunk_int = int.from_bytes(payload[i:i+8], "little")
+        result_int = chunk_int ^ mask_int
+        payload[i:i+8] = result_int.to_bytes(8, "little")
+        i += 8
+
+    # Handle remaining bytes
+    for j in range(i, length):
+        payload[j] ^= mask[j & 3]
+
     return bytes(payload)
 
 
@@ -308,15 +381,16 @@ class WSClient:
                 payload = data.encode() if isinstance(data, str) else data
                 length = len(payload)
 
+                # Fast path for small payloads (most common case)
                 if length < 126:
-                    header = bytes([0x80 | opcode, length])
+                    # bytes() + concat is faster than bytearray for small frames
+                    self.sock.sendall(bytes([0x80 | opcode, length]) + payload)
                 elif length < 0x10000:
                     header = bytes([0x80 | opcode, 126]) + struct.pack(">H", length)
+                    self.sock.sendall(header + payload)
                 else:
                     header = bytes([0x80 | opcode, 127]) + struct.pack(">Q", length)
-
-                # Use sendall to ensure complete transmission
-                self.sock.sendall(header + payload)
+                    self.sock.sendall(header + payload)
                 return True
             except (OSError, BrokenPipeError, ConnectionError):
                 return False
@@ -789,8 +863,18 @@ class HTTPHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     # Increase buffer sizes for throughput
-    rbufsize = 65536
-    wbufsize = 65536
+    rbufsize = 131072  # 128KB read buffer
+    wbufsize = 131072  # 128KB write buffer
+
+    # Pre-built status messages to avoid string formatting
+    responses = {
+        200: ("OK", "Request fulfilled"),
+        201: ("Created", "Resource created"),
+        204: ("No Content", ""),
+        400: ("Bad Request", ""),
+        404: ("Not Found", ""),
+        500: ("Internal Server Error", ""),
+    }
 
     # Flag to prevent close after WebSocket upgrade
     _ws_upgraded = False
@@ -838,10 +922,10 @@ class HTTPHandler(BaseHTTPRequestHandler):
         res_body = res.body
 
         if content_type is None:
-            body = _json_dumps(res_body).encode()
+            body = _json_dumps_cached(res_body)
             content_type = CONTENT_TYPE_JSON
         elif content_type == CONTENT_TYPE_JSON:
-            body = _json_dumps(res_body).encode()
+            body = _json_dumps_cached(res_body)
         elif isinstance(res_body, bytes):
             body = res_body
         else:
@@ -859,10 +943,12 @@ class HTTPHandler(BaseHTTPRequestHandler):
 
     def _handle(self, method: HTTPMethod, body: Any = None) -> None:
         path, query = parse_query(self.path)
+        # Avoid dict() constructor - direct attribute access is faster
+        headers = {k: v for k, v in self.headers.items()}
         req = Request(
             method=method,
             path=path,
-            headers=dict(self.headers),
+            headers=headers,
             query=query,
             body=body,
         )
@@ -972,25 +1058,91 @@ class HTTPHandler(BaseHTTPRequestHandler):
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+class ReuseAddrThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with socket reuse options for performance."""
+
+    allow_reuse_address = True
+    allow_reuse_port = True
+    request_queue_size = 2048
+
+    def server_bind(self) -> None:
+        """Bind server with optimized socket options."""
+        # Enable address reuse
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        # Enable port reuse if supported (allows multiple processes on Unix)
+        if settings.reuse_port and SO_REUSEPORT is not None:
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, SO_REUSEPORT, 1)
+            except OSError:
+                pass  # Not supported on this platform
+
+        # Increase socket buffers (64KB is a good balance)
+        try:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+        except OSError:
+            pass
+
+        super().server_bind()
+        self.server_address = self.socket.getsockname()
+
+
+def _worker_process(host: str, port: int, worker_id: int) -> None:
+    """Worker process that runs its own HTTP server."""
+    server = ReuseAddrThreadingHTTPServer((host, port), HTTPHandler)
+    if settings.debug:
+        print(f"[Worker {worker_id}] Started on {host}:{port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
+
+
 @dataclass
 class Server:
-    """HTTP + WebSocket server with start/stop lifecycle."""
+    """HTTP + WebSocket server with start/stop lifecycle and multiprocessing."""
 
-    _http: ThreadingHTTPServer | None = field(default=None, repr=False)
+    _http: ReuseAddrThreadingHTTPServer | None = field(default=None, repr=False)
     _running: bool = field(default=False, repr=False)
+    _workers: list[multiprocessing.Process] = field(default_factory=list, repr=False)
 
     def start(self) -> None:
-        """Start the server."""
+        """Start the server with optional worker processes."""
         self._running = True
         app.emit("server:start", ServerContext(self))
 
-        self._http = ThreadingHTTPServer((settings.host, settings.port), HTTPHandler)
-        threading.Thread(target=self._http.serve_forever, daemon=True).start()
+        num_workers = settings.workers
+
+        if num_workers > 1 and sys.platform != "win32":
+            # Multiprocess mode (Unix only due to SO_REUSEPORT)
+            for i in range(num_workers):
+                p = multiprocessing.Process(
+                    target=_worker_process,
+                    args=(settings.host, settings.port, i),
+                    daemon=True,
+                )
+                p.start()
+                self._workers.append(p)
+        else:
+            # Single process mode (default, works everywhere)
+            self._http = ReuseAddrThreadingHTTPServer(
+                (settings.host, settings.port), HTTPHandler
+            )
+            threading.Thread(target=self._http.serve_forever, daemon=True).start()
 
     def stop(self) -> None:
-        """Stop the server."""
+        """Stop the server and all workers."""
         self._running = False
         app.emit("server:stop", ServerContext(self))
+
+        # Stop worker processes
+        for p in self._workers:
+            p.terminate()
+            p.join(timeout=1)
+        self._workers.clear()
 
         if self._http:
             self._http.shutdown()
@@ -1004,9 +1156,12 @@ class Server:
 
         server = Server()
         server.start()
-        # Before running server
+
         if settings.debug:
-            print(f"[Server] http://{settings.host}:{settings.port}")
+            workers_info = (
+                f" ({settings.workers} workers)" if settings.workers > 1 else ""
+            )
+            print(f"[Server] http://{settings.host}:{settings.port}{workers_info}")
             print(f"[WebSocket] ws://{settings.host}:{settings.port}{settings.ws_path}")
 
         # Keep main thread alive
