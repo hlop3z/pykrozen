@@ -23,6 +23,17 @@ pub async fn run_stress_test(
     test_type: &str,
     endpoint: &str,
 ) {
+    let _ = run_stress_test_with_result(config, concurrency, duration_secs, test_type, endpoint).await;
+}
+
+/// Run a stress test and return the result for reporting.
+pub async fn run_stress_test_with_result(
+    config: &Config,
+    concurrency: usize,
+    duration_secs: u64,
+    test_type: &str,
+    endpoint: &str,
+) -> Option<StressTestResult> {
     println!(
         "    {} {} concurrent workers for {}s\n",
         "Running".blue(),
@@ -73,7 +84,7 @@ pub async fn run_stress_test(
         "mixed" => spawn_mixed_workers(config, concurrency, &stats, &running, endpoint),
         _ => {
             println!("    {} Unknown test type: {}", "Error:".red(), test_type);
-            return;
+            return None;
         }
     };
 
@@ -93,6 +104,8 @@ pub async fn run_stress_test(
     let duration = start_time.elapsed();
     let result = StressTestResult::from_stats(&stats, duration);
     result.print_report();
+
+    Some(result)
 }
 
 /// Spawn HTTP GET stress test workers.

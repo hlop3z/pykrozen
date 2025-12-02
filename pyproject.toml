@@ -64,24 +64,25 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pylint.messages_control]
 disable = [
-    "too-few-public-methods",      # R0903: SimpleNamespace subclasses don't need methods
-    "missing-function-docstring",  # C0116: Private/override methods don't need docstrings
-    "redefined-outer-name",        # W0621: Intentional for Plugin.setup(app) parameter
-    "redefined-builtin",           # W0622: Required for BaseHTTPRequestHandler.log_message
-    "invalid-name",                # C0103: do_GET/do_POST required by BaseHTTPRequestHandler
-    "protected-access",            # W0212: Internal server loop access is intentional
-    "consider-using-in",           # R1714: Style preference
-    "too-many-branches",           # R0912: Complex routing logic requires many branches
-    "too-many-arguments",          # R0913: Factory functions need multiple params
+    "too-few-public-methods",        # R0903: SimpleNamespace subclasses don't need methods
+    "missing-function-docstring",    # C0116: Private/override methods don't need docstrings
+    "redefined-outer-name",          # W0621: Intentional for Plugin.setup(app) parameter
+    "redefined-builtin",             # W0622: Required for BaseHTTPRequestHandler.log_message
+    "invalid-name",                  # C0103: do_GET/do_POST required by BaseHTTPRequestHandler
+    "protected-access",              # W0212: Internal server loop access is intentional
+    "consider-using-in",             # R1714: Style preference
+    "too-many-branches",             # R0912: Complex routing logic requires many branches
+    "too-many-arguments",            # R0913: Factory functions need multiple params
     "too-many-positional-arguments", # R0917: Factory functions need multiple params
-    "too-many-locals",             # R0914: Handler methods need multiple locals
-    "too-many-statements",         # R0915: Async handler is complex by necessity
-    "too-many-lines",              # C0302: Single-file module design is intentional
-    "line-too-long",               # C0301: Some complex lines are acceptable
-    "missing-class-docstring",     # C0115: Internal helper classes don't need docstrings
-    "broad-exception-caught",      # W0718: Intentional for server resilience
-    "consider-using-enumerate",    # C0200: XOR loop is performance-critical
-    "unused-argument",             # W0613: ws argument is required for interface compatibility
+    "too-many-locals",               # R0914: Handler methods need multiple locals
+    "too-many-statements",           # R0915: Async handler is complex by necessity
+    "too-many-lines",                # C0302: Single-file module design is intentional
+    "line-too-long",                 # C0301: Some complex lines are acceptable
+    "missing-class-docstring",       # C0115: Internal helper classes don't need docstrings
+    "broad-exception-caught",        # W0718: Intentional for server resilience
+    "consider-using-enumerate",      # C0200: XOR loop is performance-critical
+    "unused-argument",               # W0613: ws argument is required for interface compatibility
+    "no-member",                     # E1101: orjson C extension members not visible to pylint
 ]
 
 [dependency-groups]

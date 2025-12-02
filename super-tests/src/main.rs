@@ -5,16 +5,20 @@
 
 mod config;
 mod http_tests;
+mod report;
 mod stats;
 mod stress;
 mod websocket_tests;
 
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use config::Config;
+use config::{Config, ConfigFile};
+use report::MarkdownReport;
+use tokio::sync::Mutex;
 
 #[derive(Parser)]
 #[command(name = "pykrozen-tester")]
@@ -23,17 +27,21 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// HTTP server host
-    #[arg(long, default_value = "127.0.0.1")]
-    host: String,
+    /// HTTP server host (overrides config file)
+    #[arg(long)]
+    host: Option<String>,
 
-    /// HTTP server port
-    #[arg(long, default_value = "8000")]
-    http_port: u16,
+    /// HTTP server port (overrides config file)
+    #[arg(long)]
+    http_port: Option<u16>,
 
-    /// WebSocket server port
-    #[arg(long, default_value = "8765")]
-    ws_port: u16,
+    /// WebSocket server port (overrides config file)
+    #[arg(long)]
+    ws_port: Option<u16>,
+
+    /// Path to config file
+    #[arg(long, short = 'f')]
+    config: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -102,17 +110,23 @@ enum Commands {
     },
     /// Auto-start server, run all tests, and cleanup
     Auto {
-        /// Number of concurrent connections for stress test
-        #[arg(short, long, default_value = "50")]
-        concurrency: usize,
+        /// Number of concurrent connections for stress test (overrides config)
+        #[arg(short, long)]
+        concurrency: Option<usize>,
 
-        /// Duration of stress test in seconds
-        #[arg(short, long, default_value = "5")]
-        duration: u64,
+        /// Duration of stress test in seconds (overrides config)
+        #[arg(short, long)]
+        duration: Option<u64>,
 
-        /// Path to Python executable
-        #[arg(long, default_value = "python")]
-        python: String,
+        /// Path to Python executable (overrides config)
+        #[arg(long)]
+        python: Option<String>,
+    },
+    /// Generate a default config file
+    GenConfig {
+        /// Output path for config file
+        #[arg(short, long, default_value = "pykrozen-test.toml")]
+        output: String,
     },
 }
 
@@ -135,11 +149,36 @@ async fn main() {
     let cli = Cli::parse();
     print_banner();
 
-    let config = Config {
-        host: cli.host.clone(),
-        http_port: cli.http_port,
-        ws_port: cli.ws_port,
+    // Load config from file first
+    let config_file = match &cli.config {
+        Some(path) => {
+            println!("{} Loading config from: {}", "→".blue(), path);
+            ConfigFile::load(path)
+        }
+        None => ConfigFile::load_default(),
     };
+
+    // CLI arguments override config file values
+    let config = Config {
+        host: cli.host.clone().unwrap_or(config_file.server.host.clone()),
+        http_port: cli.http_port.unwrap_or(config_file.server.http_port),
+        ws_port: cli.ws_port.unwrap_or(config_file.server.ws_port),
+    };
+
+    // Handle gen-config before printing target info
+    if let Commands::GenConfig { output } = &cli.command {
+        println!("{} Generating config file: {}", "→".blue(), output);
+        match ConfigFile::generate_default(output) {
+            Ok(()) => {
+                println!("{} Config file created successfully!", "✓".green());
+                println!("\nEdit {} to customize settings.", output);
+            }
+            Err(e) => {
+                println!("{} Failed to create config file: {}", "✗".red(), e);
+            }
+        }
+        return;
+    }
 
     println!(
         "{} HTTP: {}:{} | WebSocket: {}:{}",
@@ -157,7 +196,34 @@ async fn main() {
             duration,
             endpoints,
         } => {
-            run_all_tests(&config, concurrency, duration, endpoints).await;
+            let report = Arc::new(Mutex::new(MarkdownReport::new(
+                &config.host,
+                config.http_port,
+                config.ws_port,
+            )));
+            run_all_tests(
+                &config,
+                concurrency,
+                duration,
+                endpoints,
+                Some(report.clone()),
+            )
+            .await;
+
+            // Write report
+            let rpt = report.lock().await;
+            match rpt.write_default() {
+                Ok(filename) => {
+                    println!(
+                        "\n{} Report saved to: {}",
+                        "📄".to_string(),
+                        filename.green()
+                    );
+                }
+                Err(e) => {
+                    println!("\n{} Failed to write report: {}", "⚠".yellow(), e);
+                }
+            }
         }
         Commands::Get { paths } => {
             let paths = parse_paths(paths, vec!["/"]);
@@ -192,7 +258,13 @@ async fn main() {
             duration,
             python,
         } => {
+            let concurrency = concurrency.unwrap_or(config_file.test.concurrency);
+            let duration = duration.unwrap_or(config_file.test.duration);
+            let python = python.unwrap_or(config_file.test.python.clone());
             run_auto_test(&config, concurrency, duration, &python).await;
+        }
+        Commands::GenConfig { .. } => {
+            // Already handled above
         }
     }
 }
@@ -207,13 +279,20 @@ fn start_server(python: &str, host: &str, http_port: u16, ws_port: u16) -> std::
         server_script.display()
     );
 
-    Command::new(python)
+    // Split python command to handle "uv run python" style commands
+    let parts: Vec<&str> = python.split_whitespace().collect();
+    let (cmd, args) = parts.split_first().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Empty python command")
+    })?;
+
+    Command::new(cmd)
+        .args(args)
         .arg(&server_script)
         .env("HOST", host)
         .env("HTTP_PORT", http_port.to_string())
         .env("WS_PORT", ws_port.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .spawn()
 }
 
@@ -296,8 +375,30 @@ async fn run_auto_test(config: &Config, concurrency: usize, duration: u64, pytho
 
     println!();
 
+    // Create report
+    let report = Arc::new(Mutex::new(MarkdownReport::new(
+        &config.host,
+        config.http_port,
+        config.ws_port,
+    )));
+
     // Run all tests
-    run_all_tests(config, concurrency, duration, None).await;
+    run_all_tests(config, concurrency, duration, None, Some(report.clone())).await;
+
+    // Write report
+    let rpt = report.lock().await;
+    match rpt.write_default() {
+        Ok(filename) => {
+            println!(
+                "\n{} Report saved to: {}",
+                "📄".to_string(),
+                filename.green()
+            );
+        }
+        Err(e) => {
+            println!("\n{} Failed to write report: {}", "⚠".yellow(), e);
+        }
+    }
 
     println!();
     println!("{}", "═══ Cleanup ═══".yellow().bold());
@@ -327,11 +428,7 @@ async fn run_health_check(config: &Config) {
             if resp.status().is_success() || resp.status().as_u16() == 200 {
                 println!("{} ({})", "OK".green().bold(), resp.status());
             } else {
-                println!(
-                    "{} ({})",
-                    "WARNING".yellow().bold(),
-                    resp.status()
-                );
+                println!("{} ({})", "WARNING".yellow().bold(), resp.status());
             }
         }
         Err(e) => {
@@ -356,7 +453,13 @@ async fn run_health_check(config: &Config) {
     println!();
 }
 
-async fn run_all_tests(config: &Config, concurrency: usize, duration: u64, endpoints: Option<String>) {
+async fn run_all_tests(
+    config: &Config,
+    concurrency: usize,
+    duration: u64,
+    endpoints: Option<String>,
+    report: Option<Arc<Mutex<MarkdownReport>>>,
+) {
     let paths = parse_paths(endpoints, vec!["/"]);
 
     // Health check first
@@ -381,16 +484,64 @@ async fn run_all_tests(config: &Config, concurrency: usize, duration: u64, endpo
     println!("{}", "═══ Stress Tests ═══".yellow().bold());
 
     println!("\n{}", "  HTTP GET Stress Test".cyan());
-    stress::run_stress_test(config, concurrency, duration, "http-get", "/").await;
+    if let Some(result) =
+        stress::run_stress_test_with_result(config, concurrency, duration, "http-get", "/").await
+    {
+        if let Some(ref rpt) = report {
+            rpt.lock().await.add_result(
+                "HTTP GET",
+                "http-get",
+                concurrency,
+                std::time::Duration::from_secs(duration),
+                &result,
+            );
+        }
+    }
 
     println!("\n{}", "  HTTP POST Stress Test".cyan());
-    stress::run_stress_test(config, concurrency, duration, "http-post", "/").await;
+    if let Some(result) =
+        stress::run_stress_test_with_result(config, concurrency, duration, "http-post", "/").await
+    {
+        if let Some(ref rpt) = report {
+            rpt.lock().await.add_result(
+                "HTTP POST",
+                "http-post",
+                concurrency,
+                std::time::Duration::from_secs(duration),
+                &result,
+            );
+        }
+    }
 
     println!("\n{}", "  WebSocket Stress Test".cyan());
-    stress::run_stress_test(config, concurrency, duration, "websocket", "/").await;
+    if let Some(result) =
+        stress::run_stress_test_with_result(config, concurrency, duration, "websocket", "/").await
+    {
+        if let Some(ref rpt) = report {
+            rpt.lock().await.add_result(
+                "WebSocket",
+                "websocket",
+                concurrency,
+                std::time::Duration::from_secs(duration),
+                &result,
+            );
+        }
+    }
 
     println!("\n{}", "  Mixed Stress Test".cyan());
-    stress::run_stress_test(config, concurrency, duration, "mixed", "/").await;
+    if let Some(result) =
+        stress::run_stress_test_with_result(config, concurrency, duration, "mixed", "/").await
+    {
+        if let Some(ref rpt) = report {
+            rpt.lock().await.add_result(
+                "Mixed Workload",
+                "mixed",
+                concurrency,
+                std::time::Duration::from_secs(duration),
+                &result,
+            );
+        }
+    }
 
     println!();
     println!("{}", "═══ All Tests Complete ═══".green().bold());

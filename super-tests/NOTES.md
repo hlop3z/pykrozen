@@ -25,6 +25,7 @@ Server.run(port=8000, use_async=True)
 ## Optional Dependencies
 
 Install for maximum performance:
+
 ```bash
 pip install orjson numpy aiohttp
 ```
@@ -35,12 +36,12 @@ pip install orjson numpy aiohttp
 
 ## Baseline Performance (Threaded Server)
 
-| Test Type | Requests/sec | Avg Latency | Throughput |
-|-----------|-------------|-------------|------------|
-| HTTP GET  | ~8,200 RPS  | 6.0ms       | 1.7 MB/s   |
-| HTTP POST | ~9,400 RPS  | 5.3ms       | 1.0 MB/s   |
-| WebSocket | ~35,000 msg/s | 1.4ms     | 1.2 MB/s   |
-| Mixed     | ~5,200 RPS  | 0.8ms       | 0.4 MB/s   |
+| Test Type | Requests/sec  | Avg Latency | Throughput |
+| --------- | ------------- | ----------- | ---------- |
+| HTTP GET  | ~8,200 RPS    | 6.0ms       | 1.7 MB/s   |
+| HTTP POST | ~9,400 RPS    | 5.3ms       | 1.0 MB/s   |
+| WebSocket | ~35,000 msg/s | 1.4ms       | 1.2 MB/s   |
+| Mixed     | ~5,200 RPS    | 0.8ms       | 0.4 MB/s   |
 
 ## Key Findings
 
@@ -55,11 +56,13 @@ pip install orjson numpy aiohttp
 ### High Impact - DONE
 
 - [x] **Optional orjson integration**
+
   - Auto-detects at import time
   - Uses `orjson.dumps()` directly (returns bytes)
   - ~2-3x JSON serialization speedup
 
 - [x] **Optional numpy XOR masking**
+
   - Vectorized XOR for WebSocket unmasking
   - ~10x speedup for large payloads
 
@@ -70,6 +73,7 @@ pip install orjson numpy aiohttp
 ### Medium Impact - DONE
 
 - [x] **HTTPHandler buffer sizes**
+
   - `rbufsize = 65536`
   - `wbufsize = 65536`
 

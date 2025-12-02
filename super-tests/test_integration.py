@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 # Import fresh pykrozen module
 import importlib
 import pykrozen
+
 importlib.reload(pykrozen)
 
 from pykrozen import App, Request, get, post, put, delete, patch

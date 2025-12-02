@@ -1,74 +1,8 @@
-"""
-Lightweight HTTP + WebSocket server with plugin system.
-
-A minimal, zero-dependency HTTP and WebSocket server designed for
-development and prototyping. Features middleware, routing, plugins,
-and WebSocket support out of the box.
-
-Example:
-    >>> from pykrozen import Server, get
-    >>> @get("/hello")
-    ... def hello(req):
-    ...     return {"message": "Hello, World!"}
-    >>> Server.run(port=8000)
-"""
+"""Lightweight HTTP + WebSocket server with plugin system."""
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
-__all__ = [
-    # Version
-    "__version__",
-    # Core classes
-    "Server",
-    "AsyncServer",
-    "App",
-    "Plugin",
-    # Request/Response
-    "Request",
-    "Response",
-    "ResponseDict",
-    "UploadedFile",
-    # WebSocket
-    "WSClient",
-    "WSMessage",
-    "WSContext",
-    # Context types
-    "HTTPContext",
-    "ServerContext",
-    "Route",
-    # Global app and decorators
-    "app",
-    "get",
-    "post",
-    "put",
-    "delete",
-    "patch",
-    "on",
-    "use",
-    # Factory functions
-    "make_request",
-    "make_response",
-    # Response helpers
-    "html",
-    "text",
-    "file",
-    "upload",
-    # Type aliases
-    "MiddlewareFn",
-    "RouteHandler",
-    "HookHandler",
-    "UploadHandler",
-    "PluginProtocol",
-    # Performance introspection
-    "get_backends",
-    # Router
-    "RadixRouter",
-    "RouteMatch",
-]
-
 import asyncio
-import contextlib
 import inspect
 import json
 import os
@@ -78,128 +12,95 @@ import threading
 from base64 import b64encode
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
+from enum import Enum
 from hashlib import sha1
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, NamedTuple, Protocol, TypedDict
 
 from pykrozen.router import RadixRouter, RouteMatch
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Performance: Pre-computed constants and caches
+# Enums and Constants
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Pre-encode common response components
-_JSON_CONTENT_TYPE = b"application/json"
-_HTTP_200 = b"HTTP/1.1 200 OK\r\n"
-_HTTP_201 = b"HTTP/1.1 201 Created\r\n"
-_CRLF = b"\r\n"
+
+class HTTPMethod(str, Enum):
+    """HTTP method constants."""
+
+    GET = "GET"
+    POST = "POST"
+    PUT = "PUT"
+    DELETE = "DELETE"
+    PATCH = "PATCH"
+
+
+class WSOpcode(int, Enum):
+    """WebSocket frame opcodes."""
+
+    TEXT = 1
+    BINARY = 2
+    CLOSE = 8
+    PING = 9
+    PONG = 10
+
+
+# Common Content-Type constants
+CONTENT_TYPE_JSON = "application/json"
+CONTENT_TYPE_HTML = "text/html; charset=utf-8"
+CONTENT_TYPE_TEXT = "text/plain; charset=utf-8"
+CONTENT_TYPE_OCTET = "application/octet-stream"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Optional Performance Backends (orjson, numpy)
+# Settings
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Try to import orjson for faster JSON serialization (~2-3x speedup)
-_orjson: Any = None
-try:
-    import orjson as _orjson_module
 
-    _orjson = _orjson_module
+@dataclass
+class Settings:
+    """Global server configuration. Modify before calling `Server.run()`."""
 
-    def _json_dumps(obj: Any) -> str:
-        result: str = _orjson.dumps(obj).decode("utf-8")
-        return result
-
-    def _json_loads(data: bytes | str) -> Any:
-        return _orjson.loads(data)
-
-    _JSON_BACKEND = "orjson"
-except ImportError:
-
-    def _json_dumps(obj: Any) -> str:
-        return json.dumps(obj, separators=(",", ":"))
-
-    def _json_loads(data: bytes | str) -> Any:
-        return json.loads(data)
-
-    _JSON_BACKEND = "json"
-
-# Try to import numpy for faster XOR masking (~10x speedup for large payloads)
-_np: Any = None
-try:
-    import numpy as _np_module
-
-    _np = _np_module
-
-    def _xor_unmask_fast(payload: bytearray, mask: bytes) -> bytes:
-        """Vectorized XOR unmask using numpy."""
-        payload_arr = _np.frombuffer(payload, dtype=_np.uint8)
-        mask_arr = _np.frombuffer(mask, dtype=_np.uint8)
-        # Tile mask to match payload length and XOR
-        tiled_mask = _np.tile(mask_arr, (len(payload) + 3) // 4)[: len(payload)]
-        return bytes(_np.bitwise_xor(payload_arr, tiled_mask))
-
-    _XOR_BACKEND = "numpy"
-except ImportError:
-
-    def _xor_unmask_fast(payload: bytearray, mask: bytes) -> bytes:
-        """Pure Python XOR unmask (optimized)."""
-        m0, m1, m2, m3 = mask[0], mask[1], mask[2], mask[3]
-        mask_cycle = (m0, m1, m2, m3)
-        for i in range(len(payload)):
-            payload[i] ^= mask_cycle[i & 3]
-        return bytes(payload)
-
-    _XOR_BACKEND = "python"
+    port: int = 8000
+    host: str = "127.0.0.1"
+    ws_path: str = "/ws"
+    debug: bool = False
+    base_dir: Path = Path.cwd()
 
 
-# Try to import aiohttp for async HTTP server (~3-10x throughput improvement)
-_aiohttp_web: Any = None
-try:
-    import aiohttp.web as _aiohttp_web_module
-
-    _aiohttp_web = _aiohttp_web_module
-    _ASYNC_BACKEND = "aiohttp"
-except ImportError:
-    _ASYNC_BACKEND = "threading"
+# Global settings instance
+settings = Settings()
 
 
-def get_backends() -> dict[str, str]:
-    """Return the active performance backends.
-
-    Returns:
-        dict with 'json', 'xor', and 'server' keys indicating which backend is active.
-
-    Example:
-        >>> from pykrozen import get_backends
-        >>> get_backends()
-        {'json': 'orjson', 'xor': 'numpy', 'server': 'aiohttp'}  # if all installed
-        {'json': 'json', 'xor': 'python', 'server': 'threading'}   # stdlib fallback
-    """
-    return {"json": _JSON_BACKEND, "xor": _XOR_BACKEND, "server": _ASYNC_BACKEND}
+# ──────────────────────────────────────────────────────────────────────────────
+# JSON and XOR helpers (pure stdlib)
+# ──────────────────────────────────────────────────────────────────────────────
 
 
-# Pre-computed status lines for common codes
-_STATUS_LINES: dict[int, bytes] = {
-    200: b"HTTP/1.1 200 OK\r\n",
-    201: b"HTTP/1.1 201 Created\r\n",
-    204: b"HTTP/1.1 204 No Content\r\n",
-    400: b"HTTP/1.1 400 Bad Request\r\n",
-    401: b"HTTP/1.1 401 Unauthorized\r\n",
-    403: b"HTTP/1.1 403 Forbidden\r\n",
-    404: b"HTTP/1.1 404 Not Found\r\n",
-    500: b"HTTP/1.1 500 Internal Server Error\r\n",
-}
+def _json_dumps(obj: Any) -> str:
+    return json.dumps(obj, separators=(",", ":"))
+
+
+def _json_loads(data: bytes | str) -> Any:
+    return json.loads(data)
+
+
+def _xor_unmask_fast(payload: bytearray, mask: bytes) -> bytes:
+    """Pure Python XOR unmask."""
+    for i in range(len(payload)):
+        payload[i] ^= mask[i & 3]
+    return bytes(payload)
+
 
 WS_MAGIC = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 # Pre-computed hook keys to avoid string operations per-request
 _HTTP_HOOK_KEYS: dict[str, str] = {
-    "GET": "http:get",
-    "POST": "http:post",
-    "PUT": "http:put",
-    "DELETE": "http:delete",
-    "PATCH": "http:patch",
+    HTTPMethod.GET: "http:get",
+    HTTPMethod.POST: "http:post",
+    HTTPMethod.PUT: "http:put",
+    HTTPMethod.DELETE: "http:delete",
+    HTTPMethod.PATCH: "http:patch",
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -228,11 +129,6 @@ def _run_sync(coro: Coroutine[Any, Any, Any]) -> Any:
     return loop.run_until_complete(coro)
 
 
-def _is_coroutine_function(func: Callable[..., Any]) -> bool:
-    """Check if a function is a coroutine function."""
-    return inspect.iscoroutinefunction(func)
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Type Definitions
 # ──────────────────────────────────────────────────────────────────────────────
@@ -247,58 +143,23 @@ class Route(NamedTuple):
 
 
 class ResponseDict(TypedDict, total=False):
-    """TypedDict for route handler responses.
+    """Route handler response: body, status, headers (all optional)."""
 
-    All fields are optional. Defaults:
-        - body: {} (empty dict, serialized as JSON)
-        - status: 200
-        - headers: {} (Content-Type defaults to application/json)
-
-    Example:
-        >>> @get("/page")
-        ... def page(req) -> ResponseDict:
-        ...     return {"body": "<h1>Hi</h1>", "headers": {"Content-Type": "text/html"}}
-        >>>
-        >>> @get("/api")
-        ... def api(req) -> ResponseDict:
-        ...     return {"body": {"message": "Hello"}, "status": 200}
-    """
-
-    body: Any  # Response body: dict/list (JSON), str, or bytes
-    status: int  # HTTP status code (default: 200)
-    headers: dict[str, str]  # Response headers. Set Content-Type to change format
+    body: Any
+    status: int
+    headers: dict[str, str]
 
 
 class UploadedFile(TypedDict):
-    """TypedDict representing an uploaded file.
+    """Uploaded file from multipart form data: filename, content_type, content."""
 
-    Example:
-        >>> def handle_upload(files: list[UploadedFile]) -> ResponseDict:
-        ...     for f in files:
-        ...         print(f["filename"], len(f["content"]), "bytes")
-        ...     return {"body": {"uploaded": len(files)}}
-    """
-
-    filename: str  # Original filename from the upload
-    content_type: str  # MIME type of the file
-    content: bytes  # Raw file content as bytes
+    filename: str
+    content_type: str
+    content: bytes
 
 
 class Request:
-    """HTTP request context with optimized memory layout.
-
-    Uses __slots__ for memory efficiency. Core attributes are fixed,
-    but 'extra' dict allows custom data attachment.
-
-    Attributes:
-        method: HTTP method (GET, POST, etc.)
-        path: URL path without query string
-        headers: Request headers
-        query: Parsed query string parameters
-        body: Request body (parsed JSON for POST, raw bytes for multipart)
-        params: URL parameters from dynamic routes (e.g., {"id": "123"} for /users/:id)
-        extra: Additional data attached by middleware
-    """
+    """HTTP request context: method, path, headers, query, body, params, extra."""
 
     __slots__ = ("method", "path", "headers", "query", "body", "params", "extra")
 
@@ -333,10 +194,7 @@ class Request:
 
 
 class Response:
-    """HTTP response context with optimized memory layout.
-
-    Uses __slots__ for memory efficiency. Set stop=True to halt middleware.
-    """
+    """HTTP response context: status, body, headers, stop."""
 
     __slots__ = ("status", "body", "headers", "stop")
 
@@ -375,10 +233,18 @@ class HTTPContext(NamedTuple):
 
 @dataclass
 class WSClient:
-    """WebSocket client connection. Use 'data' namespace for per-connection state."""
+    """WebSocket client connection with send/recv/close methods."""
 
     sock: socket.socket
     data: SimpleNamespace = field(default_factory=SimpleNamespace)
+
+    def _send_handshake_response(self, key: bytes) -> None:
+        accept = b64encode(sha1(key + WS_MAGIC).digest())
+        self.sock.send(
+            b"HTTP/1.1 101 Switching Protocols\r\n"
+            b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+        )
 
     def handshake(self) -> None:
         """Perform WebSocket handshake."""
@@ -388,15 +254,14 @@ class WSClient:
             for line in req.split(b"\r\n")
             if line.lower().startswith(b"sec-websocket-key")
         )
-        accept = b64encode(sha1(key + WS_MAGIC).digest())
-        self.sock.send(
-            b"HTTP/1.1 101 Switching Protocols\r\n"
-            b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
-            b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
-        )
+        self._send_handshake_response(key)
+
+    def handshake_with_key(self, key: str) -> None:
+        """Perform WebSocket handshake with pre-parsed key."""
+        self._send_handshake_response(key.encode())
 
     def recv(self) -> tuple[int | None, bytes | None]:
-        """Receive a WebSocket frame. Returns (opcode, data)."""
+        """Receive a WebSocket frame, returns (opcode, data)."""
         header = self.sock.recv(2)
         if len(header) < 2:
             return None, None
@@ -427,9 +292,9 @@ class WSClient:
 
         return opcode, data
 
-    def send(self, data: Any, opcode: int = 1) -> None:
-        """Send data over WebSocket. Auto-serializes dicts to JSON."""
-        if opcode == 1 and not isinstance(data, (str, bytes)):
+    def send(self, data: Any, opcode: int = WSOpcode.TEXT) -> None:
+        """Send data over WebSocket (auto-serializes dicts to JSON)."""
+        if opcode == WSOpcode.TEXT and not isinstance(data, (str, bytes)):
             data = _json_dumps(data)
         payload = data.encode() if isinstance(data, str) else data
         length = len(payload)
@@ -449,10 +314,7 @@ class WSClient:
 
 
 class WSMessage:
-    """WebSocket message context with optimized memory layout.
-
-    Uses __slots__ for memory efficiency.
-    """
+    """WebSocket message context: ws, data, reply, stop."""
 
     __slots__ = ("ws", "data", "reply", "stop")
 
@@ -495,7 +357,7 @@ class ServerContext(NamedTuple):
 
 
 class PluginProtocol(Protocol):
-    """Protocol for plugins. Implement setup() to register hooks/routes."""
+    """Protocol for plugins. Implement `setup()` to register hooks/routes."""
 
     name: str
 
@@ -523,24 +385,7 @@ UploadHandler = Callable[[list[UploadedFile]], ResponseDict]
 
 @dataclass
 class App:
-    """Central registry for plugins, hooks, routes, and middleware.
-
-    Uses a high-performance radix tree router for O(path_length) route matching
-    with support for dynamic parameters (:id) and wildcards (*path).
-
-    Example:
-        >>> from pykrozen import app, get
-        >>>
-        >>> @get("/users/:id")
-        ... def get_user(req):
-        ...     user_id = req.params["id"]  # Extract route parameter
-        ...     return {"body": {"id": user_id}}
-        >>>
-        >>> @get("/files/*filepath")
-        ... def serve_file(req):
-        ...     filepath = req.params["filepath"]  # Wildcard captures rest of path
-        ...     return {"body": {"file": filepath}}
-    """
+    """Application Base Class with routing, middleware, and hooks."""
 
     _hooks: dict[str, list[HookHandler]] = field(default_factory=dict)
     _middleware: list[MiddlewareFn] = field(default_factory=list)
@@ -548,11 +393,11 @@ class App:
     # Legacy routes dict for backwards compatibility
     _routes: dict[str, dict[str, RouteHandler]] = field(
         default_factory=lambda: {
-            "GET": {},
-            "POST": {},
-            "PUT": {},
-            "DELETE": {},
-            "PATCH": {},
+            HTTPMethod.GET: {},
+            HTTPMethod.POST: {},
+            HTTPMethod.PUT: {},
+            HTTPMethod.DELETE: {},
+            HTTPMethod.PATCH: {},
         }
     )
     _plugins: list[PluginProtocol] = field(default_factory=list)
@@ -578,66 +423,43 @@ class App:
         self._middleware.append(fn)
         return fn
 
-    def _register_route(self, method: str, path: str, fn: RouteHandler) -> RouteHandler:
+    def _register_route(
+        self, method: HTTPMethod, path: str, fn: RouteHandler
+    ) -> RouteHandler:
         """Register a route with both radix router and legacy dict."""
         self._router.add(method, path, fn)
         self._routes.setdefault(method, {})[path] = fn
         return fn
 
-    def get(self, path: str) -> Callable[[RouteHandler], RouteHandler]:
-        """Decorator to register a GET route handler.
-
-        Supports dynamic parameters with :param syntax and wildcards with *name.
-
-        Example:
-            >>> @get("/users")
-            ... def list_users(req): ...
-            >>>
-            >>> @get("/users/:id")
-            ... def get_user(req):
-            ...     return {"body": {"id": req.params["id"]}}
-            >>>
-            >>> @get("/files/*path")
-            ... def serve_file(req):
-            ...     return {"body": {"path": req.params["path"]}}
-        """
+    def _make_route_decorator(
+        self, method: HTTPMethod, path: str
+    ) -> Callable[[RouteHandler], RouteHandler]:
+        """Create a route decorator for the given HTTP method."""
 
         def decorator(fn: RouteHandler) -> RouteHandler:
-            return self._register_route("GET", path, fn)
+            return self._register_route(method, path, fn)
 
         return decorator
+
+    def get(self, path: str) -> Callable[[RouteHandler], RouteHandler]:
+        """Decorator to register a GET route handler."""
+        return self._make_route_decorator(HTTPMethod.GET, path)
 
     def post(self, path: str) -> Callable[[RouteHandler], RouteHandler]:
         """Decorator to register a POST route handler."""
-
-        def decorator(fn: RouteHandler) -> RouteHandler:
-            return self._register_route("POST", path, fn)
-
-        return decorator
+        return self._make_route_decorator(HTTPMethod.POST, path)
 
     def put(self, path: str) -> Callable[[RouteHandler], RouteHandler]:
         """Decorator to register a PUT route handler."""
-
-        def decorator(fn: RouteHandler) -> RouteHandler:
-            return self._register_route("PUT", path, fn)
-
-        return decorator
+        return self._make_route_decorator(HTTPMethod.PUT, path)
 
     def delete(self, path: str) -> Callable[[RouteHandler], RouteHandler]:
         """Decorator to register a DELETE route handler."""
-
-        def decorator(fn: RouteHandler) -> RouteHandler:
-            return self._register_route("DELETE", path, fn)
-
-        return decorator
+        return self._make_route_decorator(HTTPMethod.DELETE, path)
 
     def patch(self, path: str) -> Callable[[RouteHandler], RouteHandler]:
         """Decorator to register a PATCH route handler."""
-
-        def decorator(fn: RouteHandler) -> RouteHandler:
-            return self._register_route("PATCH", path, fn)
-
-        return decorator
+        return self._make_route_decorator(HTTPMethod.PATCH, path)
 
     def emit(self, event: str, ctx: Any) -> Any:
         """Emit an event to all registered hooks."""
@@ -656,10 +478,7 @@ class App:
         return True
 
     def route(self, method: str, path: str, req: Request) -> ResponseDict | None:
-        """Find and execute a route handler using radix tree matching.
-
-        Automatically extracts URL parameters and attaches them to req.params.
-        """
+        """Find and execute a route handler using radix tree matching."""
         # Use radix router for matching (supports :param and *wildcard)
         match = self._router.match_new(method, path)
         if not match.matched or match.handler is None:
@@ -679,10 +498,18 @@ class App:
         response: ResponseDict | None = result
         return response
 
+    def static(self, path_prefix: str):
+        @get(f"{path_prefix}/*path")
+        def static_base(req):
+            path = req.params["path"]
+            return file(settings.base_dir / "static" / path)
+
+        return static_base
+
 
 @dataclass
 class Plugin:
-    """Base plugin class. Subclass and override setup()."""
+    """Base plugin class. Subclass and override `setup()`."""
 
     name: str = "plugin"
 
@@ -699,6 +526,7 @@ post = app.post
 put = app.put
 delete = app.delete
 patch = app.patch
+static = app.static
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -708,7 +536,6 @@ patch = app.patch
 
 # Empty dict singleton to avoid allocations
 _EMPTY_DICT: dict[str, str] = {}
-_EMPTY_HEADERS: dict[str, str] = {}
 
 
 def parse_query(path: str) -> tuple[str, dict[str, str]]:
@@ -755,10 +582,10 @@ def make_response(
 
 # MIME types for common file extensions
 MIME_TYPES: dict[str, str] = {
-    ".html": "text/html; charset=utf-8",
+    ".html": CONTENT_TYPE_HTML,
     ".css": "text/css; charset=utf-8",
     ".js": "application/javascript; charset=utf-8",
-    ".json": "application/json; charset=utf-8",
+    ".json": f"{CONTENT_TYPE_JSON}; charset=utf-8",
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -767,7 +594,7 @@ MIME_TYPES: dict[str, str] = {
     ".ico": "image/x-icon",
     ".webp": "image/webp",
     ".pdf": "application/pdf",
-    ".txt": "text/plain; charset=utf-8",
+    ".txt": CONTENT_TYPE_TEXT,
     ".xml": "application/xml; charset=utf-8",
     ".woff": "font/woff",
     ".woff2": "font/woff2",
@@ -780,81 +607,42 @@ MIME_TYPES: dict[str, str] = {
 
 
 def html(content: str, status: int = 200) -> ResponseDict:
-    """Create an HTML response.
-
-    Args:
-        content: HTML string to return.
-        status: HTTP status code (default: 200).
-
-    Returns:
-        ResponseDict with body, headers, and status.
-
-    Example:
-        >>> @get("/page")
-        ... def page(req):
-        ...     return html("<h1>Hello World</h1>")
-    """
+    """Create an HTML response."""
     return {
         "body": content,
-        "headers": {"Content-Type": "text/html; charset=utf-8"},
+        "headers": {"Content-Type": CONTENT_TYPE_HTML},
         "status": status,
     }
 
 
 def text(content: str, status: int = 200) -> ResponseDict:
-    """Create a plain text response.
-
-    Args:
-        content: Text string to return.
-        status: HTTP status code (default: 200).
-
-    Returns:
-        ResponseDict with body, headers, and status.
-
-    Example:
-        >>> @get("/robots.txt")
-        ... def robots(req):
-        ...     return text("User-agent: *\\nDisallow:")
-    """
+    """Create a plain text response."""
     return {
         "body": content,
-        "headers": {"Content-Type": "text/plain; charset=utf-8"},
+        "headers": {"Content-Type": CONTENT_TYPE_TEXT},
         "status": status,
     }
 
 
+def error(message: str, status: int = 400) -> ResponseDict:
+    """Create an error response with JSON body `{"error": message}`."""
+    return {"body": {"error": message}, "status": status}
+
+
 def file(
-    filepath: str, content_type: str | None = None, status: int = 200
+    filepath: Path, content_type: str | None = None, status: int = 200
 ) -> ResponseDict:
-    """Create a file response by reading from disk.
-
-    Args:
-        filepath: Path to the file to serve.
-        content_type: MIME type (auto-detected from extension if not provided).
-        status: HTTP status code (default: 200).
-
-    Returns:
-        ResponseDict with body (bytes), headers, and status.
-        Returns 404 response if file not found.
-
-    Example:
-        >>> @get("/logo")
-        ... def logo(req):
-        ...     return file("static/logo.png")
-        >>>
-        >>> @get("/download")
-        ... def download(req):
-        ...     return file("data/report.pdf", "application/pdf")
-    """
+    """Create a file response (auto-detects MIME type). Returns 404 if not found."""
+    _filepath = str(filepath)
     try:
-        with open(filepath, "rb") as f:
+        with open(_filepath, "rb") as f:
             content = f.read()
     except FileNotFoundError:
-        return {"body": {"error": "File not found"}, "status": 404}
+        return error("File not found", 404)
 
     if content_type is None:
-        ext = os.path.splitext(filepath)[1].lower()
-        content_type = MIME_TYPES.get(ext, "application/octet-stream")
+        ext = os.path.splitext(_filepath)[1].lower()
+        content_type = MIME_TYPES.get(ext, CONTENT_TYPE_OCTET)
 
     return {
         "body": content,
@@ -892,7 +680,7 @@ def _parse_multipart(body: bytes, boundary: bytes) -> list[UploadedFile]:
             continue
 
         filename = disposition.split('filename="')[1].split('"')[0]
-        content_type = headers.get("content-type", "application/octet-stream")
+        content_type = headers.get("content-type", CONTENT_TYPE_OCTET)
 
         files.append(
             {
@@ -906,43 +694,80 @@ def _parse_multipart(body: bytes, boundary: bytes) -> list[UploadedFile]:
 
 
 def upload(path: str, handler: UploadHandler) -> None:
-    """Register an upload endpoint that handles multipart file uploads.
-
-    Args:
-        path: URL path for the upload endpoint.
-        handler: Function that receives list of UploadedFile and returns ResponseDict.
-
-    Example:
-        >>> def save_files(files: list[UploadedFile]) -> ResponseDict:
-        ...     for f in files:
-        ...         with open(f"uploads/{f['filename']}", "wb") as out:
-        ...             out.write(f["content"])
-        ...     return {"body": {"uploaded": len(files)}}
-        >>>
-        >>> upload("/api/upload", save_files)
-    """
+    """Register an upload endpoint for multipart file uploads."""
 
     def upload_handler(req: Request) -> ResponseDict:
         content_type = req.headers.get("Content-Type", "")
         if "multipart/form-data" not in content_type:
-            return {"body": {"error": "Expected multipart/form-data"}, "status": 400}
+            return error("Expected multipart/form-data")
 
         # Extract boundary
         if "boundary=" not in content_type:
-            return {"body": {"error": "Missing boundary"}, "status": 400}
+            return error("Missing boundary")
 
         boundary = content_type.split("boundary=")[1].strip().encode()
         if not isinstance(req.body, bytes):
-            return {"body": {"error": "Invalid body"}, "status": 400}
+            return error("Invalid body")
 
         files = _parse_multipart(req.body, boundary)
         return handler(files)
 
-    app._routes["POST"][path] = upload_handler
+    app._routes[HTTPMethod.POST][path] = upload_handler
+
+
+def _handle_ws_loop(ws: WSClient) -> None:
+    """Handle WebSocket message loop."""
+    app.emit("ws:connect", WSContext(ws))
+
+    try:
+        while True:
+            opcode, data = ws.recv()
+
+            if opcode is None or opcode == WSOpcode.CLOSE:
+                ws.send(b"", WSOpcode.CLOSE)
+                break
+
+            if opcode == WSOpcode.PING:
+                ws.send(data or b"", WSOpcode.PONG)
+                continue
+
+            if opcode == WSOpcode.TEXT and data is not None:
+                try:
+                    # Decode bytes to string first if needed
+                    text = data.decode("utf-8") if isinstance(data, bytes) else data
+                    msg = _json_loads(text)
+                    ctx = WSMessage(ws=ws, data=msg, reply=None, stop=False)
+                    app.emit("ws:message", ctx)
+
+                    if ctx.stop:
+                        continue
+                    if ctx.reply is not None:
+                        ws.send(ctx.reply)
+                    else:
+                        ws.send({"echo": msg})
+                except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+                    ws.send({"error": "invalid json"})
+
+    except (ConnectionResetError, BrokenPipeError, OSError):
+        pass
+    finally:
+        app.emit("ws:disconnect", WSContext(ws))
+        ws.close()
+
+
+def handle_ws_upgrade(sock: socket.socket, ws_key: str) -> None:
+    """Handle WebSocket upgrade from HTTP."""
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32768)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 32768)
+
+    ws = WSClient(sock)
+    ws.handshake_with_key(ws_key)
+    _handle_ws_loop(ws)
 
 
 class HTTPHandler(BaseHTTPRequestHandler):
-    """HTTP request handler with middleware and routing support."""
+    """HTTP request handler with middleware and routing."""
 
     # Disable Nagle's algorithm for lower latency
     disable_nagle_algorithm = True
@@ -958,12 +783,12 @@ class HTTPHandler(BaseHTTPRequestHandler):
         pass
 
     def _serve_html(self, filepath: str) -> bool:
-        """Serve an HTML file. Returns True if file was served."""
+        """Serve an HTML file, returns True if served."""
         try:
             with open(filepath, "rb") as f:
                 content = f.read()
             self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Type", CONTENT_TYPE_HTML)
             self.send_header("Content-Length", str(len(content)))
             self.end_headers()
             self.wfile.write(content)
@@ -978,18 +803,10 @@ class HTTPHandler(BaseHTTPRequestHandler):
         res_body = res.body
 
         if content_type is None:
-            # Default: JSON response - most common path
-            # orjson.dumps returns bytes directly, avoid double encode
-            if _orjson is not None:
-                body = _orjson.dumps(res_body)
-            else:
-                body = _json_dumps(res_body).encode()
-            content_type = "application/json"
-        elif content_type == "application/json":
-            if _orjson is not None:
-                body = _orjson.dumps(res_body)
-            else:
-                body = _json_dumps(res_body).encode()
+            body = _json_dumps(res_body).encode()
+            content_type = CONTENT_TYPE_JSON
+        elif content_type == CONTENT_TYPE_JSON:
+            body = _json_dumps(res_body).encode()
         elif isinstance(res_body, bytes):
             body = res_body
         else:
@@ -1005,7 +822,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _handle(self, method: str, body: Any = None) -> None:
+    def _handle(self, method: HTTPMethod, body: Any = None) -> None:
         path, query = parse_query(self.path)
         req = Request(
             method=method,
@@ -1078,12 +895,27 @@ class HTTPHandler(BaseHTTPRequestHandler):
         self._respond(res)
 
     def do_GET(self) -> None:
+        # Check for WebSocket upgrade on configured path
+        path = self.path.split("?")[0]  # Remove query string
+        if path == settings.ws_path:
+            upgrade = self.headers.get("Upgrade", "").lower()
+            if upgrade == "websocket":
+                ws_key = self.headers.get("Sec-WebSocket-Key")
+                if ws_key:
+                    sock = self.connection
+                    threading.Thread(
+                        target=handle_ws_upgrade,
+                        args=(sock, ws_key),
+                        daemon=True,
+                    ).start()
+                    return
+
         # Serve index.html on root path
-        if self.path == "/" or self.path == "/index.html":
+        if self.path in ("/", "/index.html"):
             script_dir = os.path.dirname(os.path.abspath(__file__))
             if self._serve_html(os.path.join(script_dir, "index.html")):
                 return
-        self._handle("GET")
+        self._handle(HTTPMethod.GET)
 
     def do_POST(self) -> None:
         content_length = self.headers.get("Content-Length")
@@ -1099,262 +931,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
             except (json.JSONDecodeError, ValueError):
                 body = raw.decode() if raw else ""
 
-        self._handle("POST", body)
-
-
-def handle_ws_connection(sock: socket.socket) -> None:
-    """Handle a WebSocket connection lifecycle."""
-    # Set socket options for better performance
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32768)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 32768)
-
-    ws = WSClient(sock)
-    ws.handshake()
-
-    app.emit("ws:connect", WSContext(ws))
-
-    try:
-        while True:
-            opcode, data = ws.recv()
-
-            if opcode is None or opcode == 8:
-                ws.send(b"", 8)
-                break
-
-            if opcode == 9:
-                ws.send(data or b"", 10)
-                continue
-
-            if opcode == 1 and data is not None:
-                try:
-                    msg = _json_loads(data)
-                    ctx = WSMessage(ws=ws, data=msg, reply=None, stop=False)
-                    app.emit("ws:message", ctx)
-
-                    if ctx.stop:
-                        continue
-                    if ctx.reply is not None:
-                        ws.send(ctx.reply)
-                    else:
-                        ws.send({"echo": msg})
-                except (json.JSONDecodeError, ValueError):
-                    ws.send({"error": "invalid json"})
-
-    except (ConnectionResetError, BrokenPipeError, OSError):
-        pass
-    finally:
-        app.emit("ws:disconnect", WSContext(ws))
-        ws.close()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Async Server (aiohttp-based, optional)
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-class AsyncServer:
-    """Async HTTP + WebSocket server using aiohttp (if available).
-
-    Provides significantly better performance than the threaded server
-    by using a single event loop instead of thread-per-request.
-    """
-
-    @staticmethod
-    async def _handle_request(request: Any) -> Any:
-        """Handle HTTP request in async context."""
-        method = request.method
-        path_with_query = request.path_qs
-        path, query = parse_query(path_with_query)
-
-        # Parse body for POST requests
-        body: Any = None
-        if method == "POST":
-            content_type = request.headers.get("Content-Type", "")
-            if "multipart/form-data" in content_type:
-                body = await request.read()
-            else:
-                raw = await request.read()
-                try:
-                    body = _json_loads(raw) if raw else None
-                except (json.JSONDecodeError, ValueError):
-                    body = raw.decode() if raw else ""
-
-        # Create request/response context
-        req = Request(
-            method=method,
-            path=path,
-            headers=dict(request.headers),
-            query=query,
-            body=body,
-        )
-        res = Response(status=200, body={}, headers={}, stop=False)
-
-        # Run middleware
-        for mw in app._middleware:
-            mw(req, res)
-            if res.stop:
-                break
-
-        # Pre-hook
-        hook_key = _HTTP_HOOK_KEYS.get(method)
-        if not res.stop and hook_key:
-            hooks = app._hooks.get(hook_key)
-            if hooks:
-                ctx = HTTPContext(req, res)
-                for fn in hooks:
-                    fn(ctx)
-                    if res.stop:
-                        break
-
-        if not res.stop:
-            # Route lookup using radix tree router (supports :param and *wildcard)
-            match = app._router.match_new(method, path)
-            if match.matched and match.handler is not None:
-                # Attach extracted parameters to request
-                if match.params:
-                    req.params.update(match.params)
-
-                result = match.handler(req)
-                # Support async handlers natively
-                if inspect.iscoroutine(result):
-                    result = await result
-
-                if result:
-                    if isinstance(result, Response):
-                        result = {
-                            "status": result.status,
-                            "body": result.body,
-                            "headers": result.headers,
-                        }
-                    res.status = result.get("status", res.status)
-                    res.body = result.get("body", res.body)
-                    headers = result.get("headers")
-                    if headers:
-                        res.headers.update(headers)
-            elif not res.body:
-                res.body = {"method": method, "path": path}
-
-            # Post-hook
-            if hook_key:
-                after_hooks = app._hooks.get(hook_key + ":after")
-                if after_hooks:
-                    ctx = HTTPContext(req, res)
-                    for fn in after_hooks:
-                        fn(ctx)
-
-        # Build response
-        content_type = res.headers.get("Content-Type")
-        if content_type is None or content_type == "application/json":
-            body_bytes = _json_dumps(res.body).encode()
-            content_type = "application/json"
-        elif isinstance(res.body, bytes):
-            body_bytes = res.body
-        else:
-            body_bytes = str(res.body).encode()
-
-        response_headers = {**res.headers, "Content-Type": content_type}
-        return _aiohttp_web.Response(
-            status=res.status,
-            body=body_bytes,
-            headers=response_headers,
-        )
-
-    @staticmethod
-    async def _handle_websocket(
-        request: Any,
-    ) -> Any:
-        """Handle WebSocket connection in async context."""
-        ws_response = _aiohttp_web.WebSocketResponse()
-        await ws_response.prepare(request)
-
-        # Create a wrapper that mimics WSClient interface
-        class AsyncWSClient:
-            def __init__(self, ws: Any) -> None:
-                self._ws = ws
-                self.data = SimpleNamespace()
-
-            def send(self, data: Any, opcode: int = 1) -> None:
-                if opcode == 1 and not isinstance(data, (str, bytes)):
-                    data = _json_dumps(data)
-                # Schedule send in event loop
-                asyncio.create_task(
-                    self._ws.send_str(data)
-                    if isinstance(data, str)
-                    else self._ws.send_bytes(data)
-                )
-
-            def close(self) -> None:
-                asyncio.create_task(self._ws.close())
-
-        ws_client = AsyncWSClient(ws_response)
-        app.emit("ws:connect", WSContext(ws_client))  # type: ignore[arg-type]
-
-        try:
-            async for msg in ws_response:
-                if msg.type == _aiohttp_web.WSMsgType.TEXT:
-                    try:
-                        data = _json_loads(msg.data)
-                        ctx = WSMessage(ws=ws_client, data=data, reply=None, stop=False)  # type: ignore[arg-type]
-                        app.emit("ws:message", ctx)
-
-                        if ctx.stop:
-                            continue
-                        if ctx.reply is not None:
-                            ws_client.send(ctx.reply)
-                        else:
-                            ws_client.send({"echo": data})
-                    except (json.JSONDecodeError, ValueError):
-                        ws_client.send({"error": "invalid json"})
-                elif msg.type == _aiohttp_web.WSMsgType.CLOSE:
-                    break
-        except Exception:
-            pass
-        finally:
-            app.emit("ws:disconnect", WSContext(ws_client))  # type: ignore[arg-type]
-
-        return ws_response
-
-    @staticmethod
-    def run(port: int = 8000, ws: int = 8765, host: str = "127.0.0.1") -> None:
-        """Run the async server."""
-        if _aiohttp_web is None:
-            raise ImportError(
-                "aiohttp is required for AsyncServer. Install with: pip install aiohttp"
-            )
-
-        async def start_server() -> None:
-            aiohttp_app = _aiohttp_web.Application()
-
-            # Add routes - catch all HTTP methods
-            aiohttp_app.router.add_route("*", "/{path:.*}", AsyncServer._handle_request)
-
-            # Add WebSocket route
-            aiohttp_app.router.add_route("GET", "/ws", AsyncServer._handle_websocket)
-
-            runner = _aiohttp_web.AppRunner(aiohttp_app)
-            await runner.setup()
-
-            site = _aiohttp_web.TCPSite(runner, host, port)
-            await site.start()
-
-            print(f"[HTTP+WS Async] -> http://{host}:{port}")
-            print(f"[WebSocket] -> ws://{host}:{port}/ws")
-
-            app.emit("server:start", ServerContext(None))  # type: ignore[arg-type]
-
-            # Keep running
-            try:
-                while True:
-                    await asyncio.sleep(3600)
-            except asyncio.CancelledError:
-                pass
-            finally:
-                app.emit("server:stop", ServerContext(None))  # type: ignore[arg-type]
-                await runner.cleanup()
-
-        with contextlib.suppress(KeyboardInterrupt):
-            asyncio.run(start_server())
+        self._handle(HTTPMethod.POST, body)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1364,99 +941,108 @@ class AsyncServer:
 
 @dataclass
 class Server:
-    """HTTP + WebSocket server with clean start/stop lifecycle."""
+    """HTTP + WebSocket server with start/stop lifecycle."""
 
-    http_port: int = 8000
-    ws_port: int = 8765
-    websockets: bool = True
-    host: str = "127.0.0.1"
     _http: ThreadingHTTPServer | None = field(default=None, repr=False)
-    _ws: socket.socket | None = field(default=None, repr=False)
     _running: bool = field(default=False, repr=False)
 
-    def _ws_loop(self) -> None:
-        """Accept WebSocket connections."""
-        while self._running and self._ws is not None:
-            try:
-                sock, _ = self._ws.accept()
-                threading.Thread(
-                    target=handle_ws_connection, args=(sock,), daemon=True
-                ).start()
-            except TimeoutError:
-                pass
-
     def start(self) -> None:
-        """Start both HTTP and WebSocket servers."""
+        """Start the server."""
         self._running = True
         app.emit("server:start", ServerContext(self))
 
-        # Use ThreadingHTTPServer (faster than ThreadPool for this workload)
-        self._http = ThreadingHTTPServer((self.host, self.http_port), HTTPHandler)
+        self._http = ThreadingHTTPServer((settings.host, settings.port), HTTPHandler)
         threading.Thread(target=self._http.serve_forever, daemon=True).start()
 
-        if self.websockets:  # start WebSocket server
-            self._ws = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._ws.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._ws.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            # Increase socket buffer sizes for better throughput
-            self._ws.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
-            self._ws.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
-            self._ws.bind((self.host, self.ws_port))
-            self._ws.listen(512)  # Higher backlog for high load
-            self._ws.settimeout(0.5)
-            threading.Thread(target=self._ws_loop, daemon=True).start()
-            print(f"[WebSocket] -> ws://localhost:{self.ws_port}")
-
-        print(f"[HTTP] -> http://localhost:{self.http_port}")
-
     def stop(self) -> None:
-        """Stop both servers."""
+        """Stop the server."""
         self._running = False
         app.emit("server:stop", ServerContext(self))
 
         if self._http:
             self._http.shutdown()
-        if self._ws:
-            self._ws.close()
 
     @staticmethod
-    def run(
-        port: int = 8000,
-        ws: int = 8765,
-        host: str = "127.0.0.1",
-        plugin: list[Plugin] | None = None,
-        use_async: bool | None = None,
-    ) -> None:
-        """Lightweight (`HTTP` + `WebSocket`) server with `plugin` system.
-
-        Args:
-            port: HTTP port (default: 8000)
-            ws: WebSocket port (default: 8765)
-            host: Host to bind to (default: 127.0.0.1)
-            plugin: List of plugins to register
-            use_async: Force async mode (True), threaded mode (False),
-                       or auto-detect (None, uses aiohttp if available)
-        """
+    def run(plugin: list[Plugin] | None = None) -> None:
+        """Start the server using global settings, optionally with plugins."""
         if plugin:
             for p in plugin:
                 app.plugin(p)
 
-        # Determine which server to use
-        should_use_async = (
-            use_async if use_async is not None else (_ASYNC_BACKEND == "aiohttp")
-        )
+        server = Server()
+        server.start()
+        # Before running server
+        if settings.debug:
+            print(f"[Server] http://{settings.host}:{settings.port}")
+            print(f"[WebSocket] ws://{settings.host}:{settings.port}{settings.ws_path}")
 
-        if should_use_async and _aiohttp_web is not None:
-            # Use async aiohttp server
-            AsyncServer.run(port=port, ws=ws, host=host)
-        else:
-            # Fall back to threaded server
-            server = Server(http_port=port, ws_port=ws, host=host)
-            server.start()
-            try:
-                while server._running:
-                    threading.Event().wait(0.5)
-            except KeyboardInterrupt:
-                pass
-            finally:
-                server.stop()
+        # Keep main thread alive
+        try:
+            while server._running:
+                threading.Event().wait(0.5)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            server.stop()
+
+
+__version__ = "0.1.0"
+__all__ = [
+    # Version
+    "__version__",
+    # Enums and Constants
+    "HTTPMethod",
+    "WSOpcode",
+    "CONTENT_TYPE_JSON",
+    "CONTENT_TYPE_HTML",
+    "CONTENT_TYPE_TEXT",
+    "CONTENT_TYPE_OCTET",
+    # Core classes
+    "Server",
+    "Settings",
+    "settings",
+    "App",
+    "Plugin",
+    # Request/Response
+    "Request",
+    "Response",
+    "ResponseDict",
+    "UploadedFile",
+    # WebSocket
+    "WSClient",
+    "WSMessage",
+    "WSContext",
+    # Context types
+    "HTTPContext",
+    "ServerContext",
+    "Route",
+    # Global app and decorators
+    "app",
+    "get",
+    "post",
+    "put",
+    "delete",
+    "patch",
+    "on",
+    "use",
+    # Global functions
+    "static",
+    # Factory functions
+    "make_request",
+    "make_response",
+    # Response helpers
+    "html",
+    "text",
+    "error",
+    "file",
+    "upload",
+    # Type aliases
+    "MiddlewareFn",
+    "RouteHandler",
+    "HookHandler",
+    "UploadHandler",
+    "PluginProtocol",
+    # Router
+    "RadixRouter",
+    "RouteMatch",
+]

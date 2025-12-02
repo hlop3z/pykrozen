@@ -1,0 +1,19 @@
+# PyKrozen Test Suite Configuration
+# This file configures the test runner settings.
+# CLI arguments will override these values.
+
+[server]
+# Server host address
+host = "127.0.0.1"
+# HTTP server port
+http_port = 8000
+# WebSocket server port
+ws_port = 8000
+
+[test]
+# Number of concurrent workers for stress tests
+concurrency = 50
+# Duration of stress tests in seconds
+duration = 5
+# Path to Python executable (e.g., "uv run python", "python3", or full path)
+python = "uv run python"
