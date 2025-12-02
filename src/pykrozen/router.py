@@ -16,12 +16,9 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
-__all__ = ["RadixRouter", "RouteMatch", "RouteNode"]
+from pykrozen.constants import NODE_DYNAMIC, NODE_STATIC, NODE_WILDCARD
 
-# Node type constants
-NODE_STATIC = 0
-NODE_DYNAMIC = 1
-NODE_WILDCARD = 2
+__all__ = ["RadixRouter", "RouteMatch", "RouteNode"]
 
 
 class RouteNode:
