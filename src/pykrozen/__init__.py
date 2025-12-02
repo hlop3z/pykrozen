@@ -79,6 +79,7 @@ class Settings:
                  (default: 1, single-process mode)
         backlog: Socket listen backlog for pending connections (default: 2048)
         reuse_port: Enable SO_REUSEPORT socket option (default: True)
+        use_async: Use asyncio-based server for better performance (default: True)
 
     Example:
         >>> from pykrozen import settings, Server
@@ -96,6 +97,7 @@ class Settings:
     workers: int = 1  # Number of worker processes (1 = single process)
     backlog: int = 2048  # Socket listen backlog
     reuse_port: bool = True  # Enable SO_REUSEPORT for load balancing
+    use_async: bool = True  # Use asyncio-based server (faster)
 
 
 # Global settings instance
@@ -400,12 +402,114 @@ class WSClient:
         self.sock.close()
 
 
+class AsyncWSClient:
+    """Async WebSocket client that works with asyncio transports."""
+
+    __slots__ = ("transport", "data", "_buffer", "_send_lock")
+
+    def __init__(self, transport: asyncio.Transport) -> None:
+        self.transport = transport
+        self.data: SimpleNamespace = SimpleNamespace()
+        self._buffer = bytearray()
+        self._send_lock = asyncio.Lock()
+
+    async def recv_async(self) -> tuple[int | None, bytes | None]:
+        """Receive a WebSocket frame asynchronously."""
+        try:
+            # Wait for at least 2 bytes (header)
+            while len(self._buffer) < 2:
+                await asyncio.sleep(0.001)  # Yield to event loop
+                if not self.transport or self.transport.is_closing():
+                    return None, None
+
+            header = bytes(self._buffer[:2])
+            opcode = header[0] & 0x0F
+            length = header[1] & 0x7F
+            offset = 2
+
+            # Extended length
+            if length == 126:
+                while len(self._buffer) < offset + 2:
+                    await asyncio.sleep(0.001)
+                    if not self.transport or self.transport.is_closing():
+                        return None, None
+                length = struct.unpack(">H", bytes(self._buffer[offset:offset + 2]))[0]
+                offset += 2
+            elif length == 127:
+                while len(self._buffer) < offset + 8:
+                    await asyncio.sleep(0.001)
+                    if not self.transport or self.transport.is_closing():
+                        return None, None
+                length = struct.unpack(">Q", bytes(self._buffer[offset:offset + 8]))[0]
+                offset += 8
+
+            # Mask
+            masked = header[1] & 0x80
+            mask = b""
+            if masked:
+                while len(self._buffer) < offset + 4:
+                    await asyncio.sleep(0.001)
+                    if not self.transport or self.transport.is_closing():
+                        return None, None
+                mask = bytes(self._buffer[offset:offset + 4])
+                offset += 4
+
+            # Payload
+            while len(self._buffer) < offset + length:
+                await asyncio.sleep(0.001)
+                if not self.transport or self.transport.is_closing():
+                    return None, None
+
+            payload = bytes(self._buffer[offset:offset + length])
+            del self._buffer[:offset + length]
+
+            # Unmask if needed
+            if masked and mask:
+                payload = _xor_unmask_fast(bytearray(payload), mask)
+
+            return opcode, payload
+        except Exception:
+            return None, None
+
+    def feed_data(self, data: bytes) -> None:
+        """Feed received data into buffer."""
+        self._buffer.extend(data)
+
+    def send(self, data: Any, opcode: int = WSOpcode.TEXT) -> bool:
+        """Send data over WebSocket."""
+        try:
+            if not self.transport or self.transport.is_closing():
+                return False
+
+            if opcode == WSOpcode.TEXT and not isinstance(data, (str, bytes)):
+                data = _json_dumps(data)
+            payload = data.encode() if isinstance(data, str) else data
+            length = len(payload)
+
+            if length < 126:
+                self.transport.write(bytes([0x80 | opcode, length]) + payload)
+            elif length < 0x10000:
+                header = bytes([0x80 | opcode, 126]) + struct.pack(">H", length)
+                self.transport.write(header + payload)
+            else:
+                header = bytes([0x80 | opcode, 127]) + struct.pack(">Q", length)
+                self.transport.write(header + payload)
+            return True
+        except (OSError, BrokenPipeError, ConnectionError):
+            return False
+
+    def close(self) -> None:
+        """Close the connection."""
+        if self.transport and not self.transport.is_closing():
+            self.transport.close()
+
+
 class WSMessage:
     """WebSocket message context: ws, data, reply, stop."""
 
     __slots__ = ("ws", "data", "reply", "stop")
 
-    ws: WSClient
+    ws: WSClient | AsyncWSClient
     data: Any
     reply: Any
     stop: bool
@@ -429,7 +533,7 @@ class WSMessage:
 class WSContext(NamedTuple):
     """WebSocket connect/disconnect context."""
 
-    ws: WSClient
+    ws: WSClient | AsyncWSClient
 
 
 class ServerContext(NamedTuple):
@@ -1054,7 +1158,373 @@ class HTTPHandler(BaseHTTPRequestHandler):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Server
+# Event Loop Selection (uvloop/winloop if available)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_LOOP_POLICY: str = "stdlib"
+
+
+def _setup_event_loop() -> None:
+    """Set up the best available event loop policy."""
+    global _LOOP_POLICY
+
+    # Try uvloop first (Unix) - 2-4x faster than stdlib
+    try:
+        import uvloop
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        _LOOP_POLICY = "uvloop"
+        return
+    except ImportError:
+        pass
+
+    # Try winloop (Windows) - uvloop port for Windows
+    try:
+        import winloop
+        asyncio.set_event_loop_policy(winloop.EventLoopPolicy())
+        _LOOP_POLICY = "winloop"
+        return
+    except ImportError:
+        pass
+
+    # Fall back to stdlib asyncio
+    _LOOP_POLICY = "stdlib"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Async HTTP Protocol (high-performance asyncio-based server)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# HTTP status messages
+_HTTP_STATUS: dict[int, str] = {
+    200: "OK",
+    201: "Created",
+    204: "No Content",
+    400: "Bad Request",
+    401: "Unauthorized",
+    403: "Forbidden",
+    404: "Not Found",
+    500: "Internal Server Error",
+}
+
+
+class AsyncHTTPProtocol(asyncio.Protocol):
+    """High-performance asyncio HTTP protocol handler."""
+
+    __slots__ = ("transport", "buffer", "keep_alive", "request_count", "_ws_client", "_ws_mode")
+
+    def __init__(self) -> None:
+        self.transport: asyncio.Transport | None = None
+        self.buffer = bytearray()
+        self.keep_alive = True
+        self.request_count = 0
+        self._ws_client: AsyncWSClient | None = None
+        self._ws_mode = False
+
+    def connection_made(self, transport: asyncio.Transport) -> None:
+        self.transport = transport
+        # Disable Nagle's algorithm
+        sock = transport.get_extra_info("socket")
+        if sock:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        self.transport = None
+
+    def data_received(self, data: bytes) -> None:
+        # If in WebSocket mode, feed data to WS client
+        if self._ws_mode and self._ws_client:
+            self._ws_client.feed_data(data)
+            return
+        self.buffer.extend(data)
+        self._process_buffer()
+
+    def _process_buffer(self) -> None:
+        """Process buffered data for complete HTTP requests."""
+        while b"\r\n\r\n" in self.buffer:
+            # Find end of headers
+            header_end = self.buffer.find(b"\r\n\r\n")
+            if header_end == -1:
+                return
+
+            header_data = bytes(self.buffer[:header_end])
+            body_start = header_end + 4
+
+            # Parse request line and headers
+            lines = header_data.split(b"\r\n")
+            if not lines:
+                self._send_error(400)
+                return
+
+            # Parse request line: METHOD PATH HTTP/1.x
+            request_line = lines[0].decode("latin-1")
+            parts = request_line.split(" ", 2)
+            if len(parts) != 3:
+                self._send_error(400)
+                return
+
+            method, path, _ = parts
+
+            # Parse headers
+            headers: dict[str, str] = {}
+            for line in lines[1:]:
+                if b": " in line:
+                    key, val = line.split(b": ", 1)
+                    headers[key.decode("latin-1")] = val.decode("latin-1")
+
+            # Check for WebSocket upgrade
+            if path == settings.ws_path and headers.get("Upgrade", "").lower() == "websocket":
+                ws_key = headers.get("Sec-WebSocket-Key")
+                if ws_key and self.transport:
+                    # Remove processed data
+                    del self.buffer[:body_start]
+                    # Handle WebSocket upgrade
+                    asyncio.create_task(self._handle_websocket(ws_key, headers))
+                    return
+
+            # Determine content length
+            content_length = int(headers.get("Content-Length", "0"))
+
+            # Check if we have complete body
+            if len(self.buffer) < body_start + content_length:
+                return  # Wait for more data
+
+            # Extract body
+            body_data = bytes(self.buffer[body_start:body_start + content_length])
+            del self.buffer[:body_start + content_length]
+
+            # Process request
+            self.request_count += 1
+            asyncio.create_task(self._handle_request(method, path, headers, body_data))
+
+    async def _handle_websocket(self, ws_key: str, headers: dict[str, str]) -> None:
+        """Handle WebSocket upgrade asynchronously using asyncio streams."""
+        if not self.transport:
+            return
+
+        # Send upgrade response
+        accept = b64encode(sha1(ws_key.encode() + WS_MAGIC).digest()).decode()
+        response = (
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+        )
+        self.transport.write(response.encode())
+
+        # Create async WebSocket client wrapper and switch to WS mode
+        ws = AsyncWSClient(self.transport)
+        ws.data = SimpleNamespace()
+        self._ws_client = ws
+        self._ws_mode = True
+
+        # Emit connect event
+        app.emit("ws:connect", WSContext(ws))
+
+        try:
+            await self._ws_message_loop(ws)
+        except (ConnectionResetError, BrokenPipeError, OSError, asyncio.CancelledError):
+            pass
+        finally:
+            self._ws_mode = False
+            self._ws_client = None
+            app.emit("ws:disconnect", WSContext(ws))
+            if self.transport and not self.transport.is_closing():
+                self.transport.close()
+
+    async def _ws_message_loop(self, ws: "AsyncWSClient") -> None:
+        """Handle WebSocket message loop asynchronously."""
+        while True:
+            opcode, data = await ws.recv_async()
+
+            if opcode is None or opcode == WSOpcode.CLOSE:
+                ws.send(b"", WSOpcode.CLOSE)
+                break
+
+            if opcode == WSOpcode.PING:
+                ws.send(data or b"", WSOpcode.PONG)
+                continue
+
+            if opcode == WSOpcode.TEXT and data is not None:
+                try:
+                    text_data = data.decode("utf-8") if isinstance(data, bytes) else data
+                    msg = _json_loads(text_data)
+                    ctx = WSMessage(ws=ws, data=msg, reply=None, stop=False)
+                    app.emit("ws:message", ctx)
+
+                    if ctx.stop:
+                        continue
+                    if ctx.reply is not None:
+                        ws.send(ctx.reply)
+                    else:
+                        ws.send({"echo": msg})
+                except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+                    ws.send({"error": "invalid json"})
+
+    async def _handle_request(
+        self, method: str, path: str, headers: dict[str, str], body_data: bytes
+    ) -> None:
+        """Handle HTTP request asynchronously."""
+        if not self.transport:
+            return
+
+        # Parse path and query
+        path_clean, query = parse_query(path)
+
+        # Parse body
+        content_type = headers.get("Content-Type", "")
+        if "multipart/form-data" in content_type:
+            body: Any = body_data
+        elif body_data:
+            try:
+                body = _json_loads(body_data)
+            except (json.JSONDecodeError, ValueError):
+                body = body_data.decode("utf-8", errors="replace")
+        else:
+            body = None
+
+        # Create request/response
+        req = Request(method=method, path=path_clean, headers=headers, query=query, body=body)
+        res = Response(status=200, body={}, headers={}, stop=False)
+
+        # Run middleware
+        for mw in app._middleware:
+            mw(req, res)
+            if res.stop:
+                self._send_response(res)
+                return
+
+        # Pre-hook
+        hook_key = _HTTP_HOOK_KEYS.get(method)
+        if hook_key:
+            hooks = app._hooks.get(hook_key)
+            if hooks:
+                ctx = HTTPContext(req, res)
+                for fn in hooks:
+                    fn(ctx)
+                    if res.stop:
+                        self._send_response(res)
+                        return
+
+        # Route matching
+        match = app._router.match_new(method, path_clean)
+        if match.matched and match.handler is not None:
+            if match.params:
+                req.params.update(match.params)
+
+            # Call handler (support async)
+            result = match.handler(req)
+            if inspect.iscoroutine(result):
+                result = await result
+
+            if result:
+                if isinstance(result, Response):
+                    res.status = result.status
+                    res.body = result.body
+                    res.headers.update(result.headers)
+                else:
+                    res.status = result.get("status", res.status)
+                    res.body = result.get("body", res.body)
+                    h = result.get("headers")
+                    if h:
+                        res.headers.update(h)
+        elif not res.body:
+            res.body = {"method": method, "path": path_clean}
+
+        # Post-hook
+        if hook_key:
+            after_hooks = app._hooks.get(hook_key + ":after")
+            if after_hooks:
+                ctx = HTTPContext(req, res)
+                for fn in after_hooks:
+                    fn(ctx)
+
+        self._send_response(res)
+
+    def _send_response(self, res: Response) -> None:
+        """Send HTTP response."""
+        if not self.transport:
+            return
+
+        # Serialize body
+        content_type = res.headers.get("Content-Type")
+        if content_type is None:
+            body = _json_dumps_cached(res.body)
+            content_type = CONTENT_TYPE_JSON
+        elif content_type == CONTENT_TYPE_JSON:
+            body = _json_dumps_cached(res.body)
+        elif isinstance(res.body, bytes):
+            body = res.body
+        else:
+            body = str(res.body).encode()
+
+        # Build response
+        status_text = _HTTP_STATUS.get(res.status, "OK")
+        headers_list = [f"HTTP/1.1 {res.status} {status_text}"]
+        headers_list.append(f"Content-Type: {content_type}")
+        headers_list.append(f"Content-Length: {len(body)}")
+
+        for k, v in res.headers.items():
+            if k != "Content-Type":
+                headers_list.append(f"{k}: {v}")
+
+        if self.keep_alive:
+            headers_list.append("Connection: keep-alive")
+
+        response = "\r\n".join(headers_list) + "\r\n\r\n"
+        self.transport.write(response.encode() + body)
+
+    def _send_error(self, status: int) -> None:
+        """Send error response."""
+        if self.transport:
+            status_text = _HTTP_STATUS.get(status, "Error")
+            body = f'{{"error":"{status_text}"}}'
+            response = (
+                f"HTTP/1.1 {status} {status_text}\r\n"
+                f"Content-Type: {CONTENT_TYPE_JSON}\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n\r\n"
+                f"{body}"
+            )
+            self.transport.write(response.encode())
+            self.transport.close()
+
+
+async def _run_async_server(host: str, port: int) -> None:
+    """Run the async HTTP server."""
+    loop = asyncio.get_event_loop()
+
+    # Create server with optimized settings
+    server = await loop.create_server(
+        AsyncHTTPProtocol,
+        host,
+        port,
+        reuse_address=True,
+        reuse_port=SO_REUSEPORT is not None and settings.reuse_port,
+        backlog=settings.backlog,
+    )
+
+    if settings.debug:
+        loop_name = _LOOP_POLICY
+        print(f"[AsyncServer] http://{host}:{port} (event loop: {loop_name})")
+        print(f"[WebSocket] ws://{host}:{port}{settings.ws_path}")
+
+    async with server:
+        await server.serve_forever()
+
+
+def _async_worker_process(host: str, port: int, worker_id: int) -> None:
+    """Worker process running async server."""
+    _setup_event_loop()
+    if settings.debug:
+        print(f"[Worker {worker_id}] Starting async server on {host}:{port}")
+    try:
+        asyncio.run(_run_async_server(host, port))
+    except KeyboardInterrupt:
+        pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Server (Legacy Threading-based)
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -1103,11 +1573,18 @@ def _worker_process(host: str, port: int, worker_id: int) -> None:
 
 @dataclass
 class Server:
-    """HTTP + WebSocket server with start/stop lifecycle and multiprocessing."""
+    """HTTP + WebSocket server with start/stop lifecycle and multiprocessing.
+
+    Supports two modes:
+    - Async mode (default): Uses asyncio for high performance. Optionally uses
+      uvloop (Unix) or winloop (Windows) if installed for even better performance.
+    - Threading mode: Uses ThreadingHTTPServer. Set `settings.use_async = False`.
+    """
 
     _http: ReuseAddrThreadingHTTPServer | None = field(default=None, repr=False)
     _running: bool = field(default=False, repr=False)
     _workers: list[multiprocessing.Process] = field(default_factory=list, repr=False)
+    _async_task: asyncio.Task[None] | None = field(default=None, repr=False)
 
     def start(self) -> None:
         """Start the server with optional worker processes."""
@@ -1116,22 +1593,45 @@ class Server:
 
         num_workers = settings.workers
 
-        if num_workers > 1 and sys.platform != "win32":
-            # Multiprocess mode (Unix only due to SO_REUSEPORT)
-            for i in range(num_workers):
-                p = multiprocessing.Process(
-                    target=_worker_process,
-                    args=(settings.host, settings.port, i),
-                    daemon=True,
-                )
-                p.start()
-                self._workers.append(p)
+        if settings.use_async:
+            # Async mode - use asyncio-based server
+            if num_workers > 1 and sys.platform != "win32":
+                # Multiprocess async mode (Unix only)
+                for i in range(num_workers):
+                    p = multiprocessing.Process(
+                        target=_async_worker_process,
+                        args=(settings.host, settings.port, i),
+                        daemon=True,
+                    )
+                    p.start()
+                    self._workers.append(p)
+            else:
+                # Single process async mode
+                _setup_event_loop()
+
+                def run_async() -> None:
+                    try:
+                        asyncio.run(_run_async_server(settings.host, settings.port))
+                    except KeyboardInterrupt:
+                        pass
+
+                threading.Thread(target=run_async, daemon=True).start()
         else:
-            # Single process mode (default, works everywhere)
-            self._http = ReuseAddrThreadingHTTPServer(
-                (settings.host, settings.port), HTTPHandler
-            )
-            threading.Thread(target=self._http.serve_forever, daemon=True).start()
+            # Legacy threading mode
+            if num_workers > 1 and sys.platform != "win32":
+                for i in range(num_workers):
+                    p = multiprocessing.Process(
+                        target=_worker_process,
+                        args=(settings.host, settings.port, i),
+                        daemon=True,
+                    )
+                    p.start()
+                    self._workers.append(p)
+            else:
+                self._http = ReuseAddrThreadingHTTPServer(
+                    (settings.host, settings.port), HTTPHandler
+                )
+                threading.Thread(target=self._http.serve_forever, daemon=True).start()
 
     def stop(self) -> None:
         """Stop the server and all workers."""
@@ -1157,7 +1657,7 @@ class Server:
         server = Server()
         server.start()
 
-        if settings.debug:
+        if settings.debug and not settings.use_async:
             workers_info = (
                 f" ({settings.workers} workers)" if settings.workers > 1 else ""
             )

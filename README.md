@@ -68,6 +68,24 @@ settings.ws_path = "/socket"  # WebSocket path (default: /ws)
 Server.run()
 ```
 
+### Optional Performance Boost
+
+For a significant throughput increase (often 2–4×), install an optimized event loop implementation:
+
+**Unix/Linux/macOS:**
+
+```bash
+pip install uvloop
+```
+
+**Windows:**
+
+```bash
+pip install winloop
+```
+
+These packages replace the default event loop with a faster, drop-in alternative.
+
 ### Settings Reference
 
 | Setting      | Type   | Default     | Description                            |
