@@ -262,14 +262,14 @@ class App:
         return static_base
 
 
-@dataclass
 class Plugin:
     """Base plugin class. Subclass and override `setup()`."""
 
     name: str = "plugin"
 
-    def setup(self, app: App) -> None:
-        pass
+    def setup(self, app: App) -> None:  # noqa: ARG002
+        """Override this method to register hooks/routes."""
+        raise NotImplementedError("Subclasses must implement setup()")
 
 
 # Global app instance and convenience decorators
@@ -286,7 +286,7 @@ static = app.static
 
 def upload(path: str, handler: UploadHandler) -> None:
     """Register an upload endpoint for multipart file uploads."""
-    app._routes[HTTPMethod.POST][path] = create_upload_handler(handler, app)
+    app._routes[HTTPMethod.POST][path] = create_upload_handler(handler)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

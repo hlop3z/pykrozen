@@ -134,27 +134,9 @@ def parse_query(path: str) -> tuple[str, dict[str, str]]:
     return base, params
 
 
-def make_request(
-    method: str,
-    path: str,
-    headers: dict[str, str],
-    query: dict[str, str],
-    body: Any = None,
-) -> Request:
-    """Create a Request object."""
-    return Request(method=method, path=path, headers=headers, query=query, body=body)
-
-
-def make_response(
-    status: int = 200, body: Any = None, headers: dict[str, str] | None = None
-) -> Response:
-    """Create a Response object."""
-    return Response(
-        status=status,
-        body=body if body is not None else {},
-        headers=headers if headers is not None else {},
-        stop=False,
-    )
+# Factory aliases (for backwards compatibility)
+make_request = Request
+make_response = Response
 
 
 def html(content: str, status: int = 200) -> ResponseDict:
@@ -244,9 +226,7 @@ def parse_multipart(body: bytes, boundary: bytes) -> list[UploadedFile]:
 UploadHandler = Callable[[list[UploadedFile]], ResponseDict]
 
 
-def create_upload_handler(
-    handler: UploadHandler, app: Any
-) -> Callable[[Request], ResponseDict]:
+def create_upload_handler(handler: UploadHandler) -> Callable[[Request], ResponseDict]:
     """Create an upload endpoint handler for multipart file uploads."""
 
     def upload_handler(req: Request) -> ResponseDict:

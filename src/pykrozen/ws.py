@@ -10,7 +10,7 @@ from base64 import b64encode
 from dataclasses import dataclass, field
 from hashlib import sha1
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import Any, NamedTuple
 
 from pykrozen.constants import (
     ERROR_CONNECTION_CLOSED,
@@ -28,10 +28,7 @@ from pykrozen.constants import (
     WS_WAIT_TIMEOUT,
     WSOpcode,
 )
-from pykrozen.utils import _json_dumps, _xor_unmask_fast
-
-if TYPE_CHECKING:
-    pass
+from pykrozen.utils import _json_dumps, _xor_unmask
 
 
 @dataclass
@@ -93,7 +90,7 @@ class WSClient:
                 if header[1] & WS_FINAL_FRAME_FLAG:
                     mask = self._recv_exact(4)
                     payload = self._recv_exact(length) if length > 0 else b""
-                    data = _xor_unmask_fast(bytearray(payload), mask)
+                    data = _xor_unmask(bytearray(payload), mask)
                 else:
                     data = self._recv_exact(length) if length > 0 else b""
 
@@ -194,7 +191,7 @@ class AsyncWSClient:
             del self._buffer[: offset + length]
 
             if masked and mask:
-                payload = _xor_unmask_fast(bytearray(payload), mask)
+                payload = _xor_unmask(bytearray(payload), mask)
 
             return opcode, payload
         except Exception:
