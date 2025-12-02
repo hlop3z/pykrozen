@@ -18,8 +18,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from pykrozen import (
     Request,
+    ResponseHTTP,
     Response,
-    ResponseDict,
     Server,
     UploadedFile,
     WSContext,
@@ -39,13 +39,13 @@ from pykrozen import (
 
 
 @use
-def logging_middleware(req: Request, res: Response) -> None:
+def logging_middleware(req: Request, res: ResponseHTTP) -> None:
     """Simple request logging middleware."""
     pass  # Silent for stress testing
 
 
 @use
-def cors_middleware(req: Request, res: Response) -> None:
+def cors_middleware(req: Request, res: ResponseHTTP) -> None:
     """Add CORS headers to all responses."""
     res.headers["Access-Control-Allow-Origin"] = "*"
     res.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
@@ -58,32 +58,24 @@ def cors_middleware(req: Request, res: Response) -> None:
 
 
 @get("/")
-def index(req: Request) -> ResponseDict:
+def index(req: Request) -> Response:
     """Root endpoint."""
     return {
         "body": {
             "message": "Welcome to PyKrozen Test Server",
             "version": "0.1.0",
             "endpoints": {
-                "GET": ["/", "/health", "/echo", "/data", "/slow"],
+                "GET": ["/", "/echo", "/data", "/slow"],
                 "POST": ["/", "/echo", "/data", "/upload"],
                 "WebSocket": ["ws://localhost:8765"],
+                "Internal": ["/_internal/health", "/_internal/info"],
             },
         }
     }
 
 
-@get("/health")
-def health_check(req: Request) -> ResponseDict:
-    """Health check endpoint."""
-    return {
-        "body": {"status": "healthy", "server": "pykrozen"},
-        "status": 200,
-    }
-
-
 @get("/echo")
-def echo_get(req: Request) -> ResponseDict:
+def echo_get(req: Request) -> Response:
     """Echo back query parameters."""
     return {
         "body": {
@@ -96,7 +88,7 @@ def echo_get(req: Request) -> ResponseDict:
 
 
 @get("/data")
-def get_data(req: Request) -> ResponseDict:
+def get_data(req: Request) -> Response:
     """Return sample data."""
     return {
         "body": {
@@ -111,7 +103,7 @@ def get_data(req: Request) -> ResponseDict:
 
 
 @get("/slow")
-def slow_endpoint(req: Request) -> ResponseDict:
+def slow_endpoint(req: Request) -> Response:
     """Intentionally slow endpoint for timeout testing."""
     import time
 
@@ -126,7 +118,7 @@ def slow_endpoint(req: Request) -> ResponseDict:
 
 
 @get("/async")
-async def async_endpoint(req: Request) -> ResponseDict:
+async def async_endpoint(req: Request) -> Response:
     """Async endpoint example."""
     await asyncio.sleep(0.01)  # Simulate async I/O
     return {
@@ -136,7 +128,7 @@ async def async_endpoint(req: Request) -> ResponseDict:
 
 
 @get("/async/slow")
-async def async_slow_endpoint(req: Request) -> ResponseDict:
+async def async_slow_endpoint(req: Request) -> Response:
     """Async slow endpoint using non-blocking sleep."""
     delay = float(req.query.get("delay", "0.1"))
     await asyncio.sleep(min(delay, 5.0))  # Non-blocking sleep
@@ -144,7 +136,7 @@ async def async_slow_endpoint(req: Request) -> ResponseDict:
 
 
 @get("/html")
-def html_page(req: Request) -> ResponseDict:
+def html_page(req: Request) -> Response:
     """Return HTML content."""
     return html(
         """
@@ -161,13 +153,13 @@ def html_page(req: Request) -> ResponseDict:
 
 
 @get("/text")
-def text_response(req: Request) -> ResponseDict:
+def text_response(req: Request) -> Response:
     """Return plain text."""
     return text("This is plain text response from PyKrozen server.")
 
 
 @get("/large")
-def large_response(req: Request) -> ResponseDict:
+def large_response(req: Request) -> Response:
     """Return a large JSON response."""
     size = int(req.query.get("size", "1000"))
     size = min(size, 100000)  # Cap at 100KB worth of items
@@ -185,7 +177,7 @@ def large_response(req: Request) -> ResponseDict:
 
 
 @post("/")
-def post_root(req: Request) -> ResponseDict:
+def post_root(req: Request) -> Response:
     """Accept POST to root."""
     return {
         "body": {
@@ -197,7 +189,7 @@ def post_root(req: Request) -> ResponseDict:
 
 
 @post("/echo")
-def echo_post(req: Request) -> ResponseDict:
+def echo_post(req: Request) -> Response:
     """Echo back the POST body."""
     return {
         "body": {
@@ -210,7 +202,7 @@ def echo_post(req: Request) -> ResponseDict:
 
 
 @post("/data")
-def post_data(req: Request) -> ResponseDict:
+def post_data(req: Request) -> Response:
     """Accept and validate data."""
     body = req.body if isinstance(req.body, dict) else {}
 
@@ -231,7 +223,7 @@ def post_data(req: Request) -> ResponseDict:
 
 
 @post("/validate")
-def validate_data(req: Request) -> ResponseDict:
+def validate_data(req: Request) -> Response:
     """Validate POST data structure."""
     body = req.body if isinstance(req.body, dict) else {}
 
@@ -251,7 +243,7 @@ def validate_data(req: Request) -> ResponseDict:
 
 
 @post("/integrity/echo")
-def integrity_echo(req: Request) -> ResponseDict:
+def integrity_echo(req: Request) -> Response:
     """Echo endpoint for data integrity testing - returns exact input."""
     return {
         "body": {
@@ -264,7 +256,7 @@ def integrity_echo(req: Request) -> ResponseDict:
 
 
 @post("/integrity/checksum")
-def integrity_checksum(req: Request) -> ResponseDict:
+def integrity_checksum(req: Request) -> Response:
     """Verify checksum of received data."""
     import hashlib
 
@@ -275,7 +267,10 @@ def integrity_checksum(req: Request) -> ResponseDict:
         return {"body": {"error": "No checksum provided"}, "status": 400}
 
     import json
-    calculated = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()[:16]
+
+    calculated = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()[
+        :16
+    ]
     body["checksum"] = received_checksum
 
     return {
@@ -289,7 +284,7 @@ def integrity_checksum(req: Request) -> ResponseDict:
 
 
 # File upload handler
-def handle_upload(files: list[UploadedFile]) -> ResponseDict:
+def handle_upload(files: list[UploadedFile]) -> Response:
     """Handle file uploads."""
     uploaded = []
     for f in files:

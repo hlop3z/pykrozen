@@ -420,9 +420,9 @@ class TestConcurrencyStress:
             nonlocal success_count
             try:
                 # Quick request cycle
-                with urllib.request.urlopen(f"{BASE_URL}/health", timeout=2) as resp:
+                with urllib.request.urlopen(f"{BASE_URL}/_internal/health", timeout=2) as resp:
                     data = resp.read()
-                    if b"healthy" in data or b"status" in data:
+                    if b"ok" in data or b"status" in data:
                         success_count += 1
                         return True
             except Exception as e:

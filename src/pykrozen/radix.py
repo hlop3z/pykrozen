@@ -1,14 +1,4 @@
-"""
-High-performance Radix Tree Router - Fastify-inspired routing.
-
-Optimized for minimal allocations and fast path matching.
-
-Performance Optimizations:
-    - Static route cache: O(1) lookup for exact path matches (no :param or *wildcard)
-    - Thread-local RouteMatch: Reuses match objects to avoid allocation per request
-    - Radix tree structure: Efficient prefix matching for dynamic routes
-    - __slots__: Reduced memory footprint for node objects
-"""
+"""High-performance radix tree router."""
 
 from __future__ import annotations
 
@@ -22,7 +12,7 @@ __all__ = ["RadixRouter", "RouteMatch", "RouteNode"]
 
 
 class RouteNode:
-    """A node in the radix tree with __slots__ for performance."""
+    """Radix tree node."""
 
     __slots__ = (
         "segment",
@@ -50,7 +40,7 @@ class RouteNode:
 
 
 class RouteMatch:
-    """Result of a successful route match."""
+    """Route match result."""
 
     __slots__ = ("handler", "params", "matched")
 
@@ -60,18 +50,17 @@ class RouteMatch:
         self.matched: bool = False
 
     def reset(self) -> None:
-        """Reset match state for reuse."""
+        """Reset for reuse."""
         self.handler = None
         self.params.clear()
         self.matched = False
 
 
-# Thread-local storage for route matching (avoid allocations)
 _tls = threading.local()
 
 
 def _get_thread_match() -> RouteMatch:
-    """Get thread-local RouteMatch to avoid allocation per request."""
+    """Get thread-local RouteMatch."""
     match = getattr(_tls, "match", None)
     if match is None:
         match = RouteMatch()
@@ -80,7 +69,7 @@ def _get_thread_match() -> RouteMatch:
 
 
 class RadixRouter:
-    """High-performance radix tree router."""
+    """Radix tree router with static cache."""
 
     __slots__ = ("_trees", "_routes", "_match_cache", "_compiled", "_static_cache")
 
@@ -89,80 +78,66 @@ class RadixRouter:
         self._routes: list[tuple[str, str, Callable[..., Any]]] = []
         self._match_cache: RouteMatch = RouteMatch()
         self._compiled: bool = False
-        # Cache for static routes (no params) - fastest path
         self._static_cache: dict[tuple[str, str], Callable[..., Any]] = {}
 
     def add(self, method: str, path: str, handler: Callable[..., Any]) -> RadixRouter:
-        """Add a route to the router."""
+        """Add route."""
         method = method.upper()
         self._routes.append((method, path, handler))
         self._compiled = False
 
-        # Get or create root node
         root = self._trees.get(method)
         if root is None:
             root = RouteNode()
             self._trees[method] = root
 
-        # Split path
-        if path == "/":
-            segments: list[str] = []
-        else:
-            path_stripped = path[1:] if path[0:1] == "/" else path
-            segments = path_stripped.split("/") if path_stripped else []
-
+        segments = (
+            [] if path == "/" else (path[1:] if path[0:1] == "/" else path).split("/")
+        )
         current = root
 
         for segment in segments:
-            first_char = segment[0:1]
-            if first_char == ":":
+            first = segment[0:1]
+            if first == ":":
                 param_name = segment[1:]
                 if current.dynamic_child is not None:
                     if current.dynamic_child.param_name != param_name:
-                        raise ValueError(
-                            f"Conflicting parameter names at {path}: "
-                            f"'{current.dynamic_child.param_name}' vs '{param_name}'"
-                        )
+                        raise ValueError(f"Conflicting param names at {path}")
                     current = current.dynamic_child
                 else:
-                    new_node = RouteNode(segment, NODE_DYNAMIC, param_name)
-                    current.dynamic_child = new_node
-                    current = new_node
-
-            elif first_char == "*":
+                    node = RouteNode(segment, NODE_DYNAMIC, param_name)
+                    current.dynamic_child = node
+                    current = node
+            elif first == "*":
                 param_name = segment[1:] if len(segment) > 1 else ""
                 if current.wildcard_child is not None:
                     if current.wildcard_child.param_name != param_name:
-                        raise ValueError(
-                            f"Conflicting wildcard names at {path}: "
-                            f"'{current.wildcard_child.param_name}' vs '{param_name}'"
-                        )
+                        raise ValueError(f"Conflicting wildcard names at {path}")
                     current = current.wildcard_child
                 else:
-                    new_node = RouteNode(segment, NODE_WILDCARD, param_name)
-                    current.wildcard_child = new_node
-                    current = new_node
+                    node = RouteNode(segment, NODE_WILDCARD, param_name)
+                    current.wildcard_child = node
+                    current = node
             else:
                 child = current.static_children.get(segment)
                 if child is not None:
                     current = child
                 else:
-                    new_node = RouteNode(segment, NODE_STATIC)
-                    current.static_children[segment] = new_node
-                    current = new_node
+                    node = RouteNode(segment, NODE_STATIC)
+                    current.static_children[segment] = node
+                    current = node
 
         if method in current.handlers:
             raise ValueError(f"Duplicate route: {method} {path}")
         current.handlers[method] = handler
 
-        # Cache static routes (no : or * in path) for O(1) lookup
         if ":" not in path and "*" not in path:
             self._static_cache[(method, path)] = handler
 
         return self
 
     def compile(self) -> RadixRouter:
-        """Mark routes as compiled."""
+        """Mark compiled."""
         self._compiled = True
         return self
 
@@ -175,36 +150,34 @@ class RadixRouter:
         params: dict[str, str],
         method: str,
     ) -> Callable[..., Any] | None:
-        """Match path segments starting from idx. Returns handler or None."""
-        # Base case: consumed all segments
+        """Match segments recursively."""
         if idx >= num_segments:
             return node.handlers.get(method)
 
         segment = segments[idx]
         next_idx = idx + 1
 
-        # Priority 1: Static match
-        static_child = node.static_children.get(segment)
-        if static_child is not None:
+        # Static
+        static = node.static_children.get(segment)
+        if static is not None:
             result = self._match_node(
-                static_child, segments, next_idx, num_segments, params, method
+                static, segments, next_idx, num_segments, params, method
             )
             if result is not None:
                 return result
 
-        # Priority 2: Dynamic match
+        # Dynamic
         dyn = node.dynamic_child
         if dyn is not None:
-            param_name = dyn.param_name
-            params[param_name] = segment
+            params[dyn.param_name] = segment
             result = self._match_node(
                 dyn, segments, next_idx, num_segments, params, method
             )
             if result is not None:
                 return result
-            del params[param_name]  # Backtrack
+            del params[dyn.param_name]
 
-        # Priority 3: Wildcard match
+        # Wildcard
         wc = node.wildcard_child
         if wc is not None:
             if wc.param_name:
@@ -214,24 +187,22 @@ class RadixRouter:
         return None
 
     def match_new(self, method: str, path: str) -> RouteMatch:
-        """Match with thread-local RouteMatch object (thread-safe, low allocation)."""
+        """Match route (thread-safe)."""
         match = _get_thread_match()
         match.reset()
 
-        # Fast path: check static cache first (O(1) for exact matches)
+        # Static cache
         handler = self._static_cache.get((method, path))
         if handler is not None:
             match.handler = handler
             match.matched = True
             return match
 
-        # Fast method lookup
         root = self._trees.get(method)
         if root is None:
             method_upper = method.upper()
             if method_upper != method:
                 root = self._trees.get(method_upper)
-                # Also check static cache with uppercase method
                 handler = self._static_cache.get((method_upper, path))
                 if handler is not None:
                     match.handler = handler
@@ -241,7 +212,6 @@ class RadixRouter:
                 return match
             method = method_upper
 
-        # Fast path for root
         if path == "/" or not path:
             handler = root.handlers.get(method)
             if handler is not None:
@@ -249,7 +219,6 @@ class RadixRouter:
                 match.matched = True
             return match
 
-        # Split path - use partition for single-segment optimization
         path_stripped = path[1:] if path[0:1] == "/" else path
         if not path_stripped:
             handler = root.handlers.get(method)
@@ -259,8 +228,6 @@ class RadixRouter:
             return match
 
         segments = path_stripped.split("/")
-
-        # Match using recursive function
         handler = self._match_node(
             root, segments, 0, len(segments), match.params, method
         )
@@ -271,7 +238,7 @@ class RadixRouter:
         return match
 
     def match(self, method: str, path: str) -> RouteMatch:
-        """Match using cached RouteMatch (not thread-safe but faster)."""
+        """Match route (not thread-safe, faster)."""
         match = self._match_cache
         match.reset()
 
@@ -300,7 +267,6 @@ class RadixRouter:
             return match
 
         segments = path_stripped.split("/")
-
         handler = self._match_node(
             root, segments, 0, len(segments), match.params, method
         )
@@ -311,27 +277,20 @@ class RadixRouter:
         return match
 
     def get_routes(self) -> list[tuple[str, str]]:
-        """Get all registered routes."""
-        return [(method, path) for method, path, _ in self._routes]
+        """Get registered routes."""
+        return [(m, p) for m, p, _ in self._routes]
 
     def _print_node(self, node: RouteNode, prefix: str, is_last: bool) -> None:
-        """Recursively print a node and its children."""
+        """Print node recursively."""
         connector = "`-- " if is_last else "|-- "
-        if node.segment:
-            type_indicator = ""
-            if node.node_type == NODE_DYNAMIC:
-                type_indicator = " (param)"
-            elif node.node_type == NODE_WILDCARD:
-                type_indicator = " (wildcard)"
-            handlers_str = (
-                f" [{', '.join(node.handlers.keys())}]" if node.handlers else ""
-            )
-            print(f"{prefix}{connector}{node.segment}{type_indicator}{handlers_str}")
-        else:
-            handlers_str = (
-                f" [{', '.join(node.handlers.keys())}]" if node.handlers else ""
-            )
-            print(f"{prefix}{connector}(root){handlers_str}")
+        type_str = ""
+        if node.node_type == NODE_DYNAMIC:
+            type_str = " (param)"
+        elif node.node_type == NODE_WILDCARD:
+            type_str = " (wildcard)"
+        handlers = f" [{', '.join(node.handlers.keys())}]" if node.handlers else ""
+        name = node.segment or "(root)"
+        print(f"{prefix}{connector}{name}{type_str}{handlers}")
 
         children: list[tuple[str, RouteNode]] = []
         for seg, child in sorted(node.static_children.items()):
@@ -346,7 +305,7 @@ class RadixRouter:
             self._print_node(child, child_prefix, i == len(children) - 1)
 
     def print_tree(self, method: str | None = None) -> None:
-        """Print the routing tree for debugging."""
+        """Print routing tree for debugging."""
         methods = [method] if method else list(self._trees.keys())
         for m in methods:
             if m not in self._trees:
@@ -356,5 +315,5 @@ class RadixRouter:
 
 
 def create_router() -> RadixRouter:
-    """Create a new radix router instance."""
+    """Create router instance."""
     return RadixRouter()

@@ -1,10 +1,9 @@
-"""HTTP request/response handling and helpers."""
+"""HTTP request/response types and helpers."""
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
-from pathlib import Path
+from dataclasses import dataclass, field
 from typing import Any, NamedTuple, TypedDict
 
 from pykrozen.constants import (
@@ -13,30 +12,27 @@ from pykrozen.constants import (
     CONTENT_TYPE_OCTET,
     CONTENT_TYPE_TEXT,
     ERROR_EXPECTED_MULTIPART,
-    ERROR_FILE_NOT_FOUND,
     ERROR_INVALID_BODY,
     ERROR_MISSING_BOUNDARY,
     HEADER_CONTENT_DISPOSITION,
     HEADER_CONTENT_TYPE,
-    MIME_TYPES,
     MULTIPART_BOUNDARY_MARKER,
     MULTIPART_FILENAME_MARKER,
 )
 
-# Empty dict singleton to avoid allocations
 _EMPTY_DICT: dict[str, str] = {}
 
 
 class Route(NamedTuple):
-    """Route definition."""
+    """Route definition: method, path, handler."""
 
     method: str
     path: str
     handler: Any
 
 
-class ResponseDict(TypedDict, total=False):
-    """Route handler response: body, status, headers (all optional)."""
+class Response(TypedDict, total=False):
+    """Route handler response dict."""
 
     body: Any
     status: int
@@ -44,7 +40,7 @@ class ResponseDict(TypedDict, total=False):
 
 
 class UploadedFile(TypedDict):
-    """Uploaded file from multipart form data: filename, content_type, content."""
+    """Uploaded file: filename, content_type, content."""
 
     filename: str
     content_type: str
@@ -52,17 +48,9 @@ class UploadedFile(TypedDict):
 
 
 class Request:
-    """HTTP request context: method, path, headers, query, body, params, extra."""
+    """HTTP request: method, path, headers, query, body, params, extra."""
 
     __slots__ = ("method", "path", "headers", "query", "body", "params", "extra")
-
-    method: str
-    path: str
-    headers: dict[str, str]
-    query: dict[str, str]
-    body: Any
-    params: dict[str, str]
-    extra: dict[str, Any]
 
     def __init__(
         self,
@@ -76,25 +64,20 @@ class Request:
     ) -> None:
         self.method = method
         self.path = path
-        self.headers = headers if headers is not None else {}
-        self.query = query if query is not None else {}
+        self.headers = headers or {}
+        self.query = query or {}
         self.body = body
-        self.params = params if params is not None else {}
+        self.params = params or {}
         self.extra = kwargs
 
     def __repr__(self) -> str:
-        return f"Request(method={self.method!r}, path={self.path!r})"
+        return f"Request({self.method!r}, {self.path!r})"
 
 
-class Response:
-    """HTTP response context: status, body, headers, stop."""
+class ResponseHTTP:
+    """Mutable HTTP response: status, body, headers, stop."""
 
     __slots__ = ("status", "body", "headers", "stop")
-
-    status: int
-    body: Any
-    headers: dict[str, str]
-    stop: bool
 
     def __init__(
         self,
@@ -105,27 +88,26 @@ class Response:
     ) -> None:
         self.status = status
         self.body = body if body is not None else {}
-        self.headers = headers if headers is not None else {}
+        self.headers = headers or {}
         self.stop = stop
 
     def __repr__(self) -> str:
-        return f"Response(status={self.status})"
+        return f"ResponseHTTP({self.status})"
 
 
 class HTTPContext(NamedTuple):
-    """Context passed to HTTP hooks."""
+    """Context for HTTP hooks: req, res."""
 
     req: Request
-    res: Response
+    res: ResponseHTTP
 
 
 def parse_query(path: str) -> tuple[str, dict[str, str]]:
-    """Parse query string from path."""
+    """Split path and query string, return (path, params)."""
     qmark = path.find("?")
     if qmark == -1:
         return path, _EMPTY_DICT
-    base = path[:qmark]
-    qs = path[qmark + 1 :]
+    base, qs = path[:qmark], path[qmark + 1 :]
     params = {}
     for pair in qs.split("&"):
         eq = pair.find("=")
@@ -134,13 +116,13 @@ def parse_query(path: str) -> tuple[str, dict[str, str]]:
     return base, params
 
 
-# Factory aliases (for backwards compatibility)
+# Backwards compatibility aliases
 make_request = Request
-make_response = Response
+make_response = ResponseHTTP
 
 
-def html(content: str, status: int = 200) -> ResponseDict:
-    """Create an HTML response."""
+def html(content: str, status: int = 200) -> Response:
+    """Create HTML response."""
     return {
         "body": content,
         "headers": {HEADER_CONTENT_TYPE: CONTENT_TYPE_HTML},
@@ -148,8 +130,8 @@ def html(content: str, status: int = 200) -> ResponseDict:
     }
 
 
-def text(content: str, status: int = 200) -> ResponseDict:
-    """Create a plain text response."""
+def text(content: str, status: int = 200) -> Response:
+    """Create plain text response."""
     return {
         "body": content,
         "headers": {HEADER_CONTENT_TYPE: CONTENT_TYPE_TEXT},
@@ -157,92 +139,269 @@ def text(content: str, status: int = 200) -> ResponseDict:
     }
 
 
-def error(message: str, status: int = 400) -> ResponseDict:
-    """Create an error response with JSON body `{"error": message}`."""
+def error(message: str, status: int = 400) -> Response:
+    """Create JSON error response."""
     return {"body": {"error": message}, "status": status}
 
 
-def file(
-    filepath: Path, content_type: str | None = None, status: int = 200
-) -> ResponseDict:
-    """Create a file response (auto-detects MIME type). Returns 404 if not found."""
-    _filepath = str(filepath)
-    try:
-        with open(_filepath, "rb") as f:
-            content = f.read()
-    except FileNotFoundError:
-        return error(ERROR_FILE_NOT_FOUND, 404)
-
-    if content_type is None:
-        ext = os.path.splitext(_filepath)[1].lower()
-        content_type = MIME_TYPES.get(ext, CONTENT_TYPE_OCTET)
-
-    return {
-        "body": content,
-        "headers": {HEADER_CONTENT_TYPE: content_type},
-        "status": status,
-    }
-
-
 def parse_multipart(body: bytes, boundary: bytes) -> list[UploadedFile]:
-    """Parse multipart form data and extract files."""
+    """Parse multipart form data, extract files."""
     files: list[UploadedFile] = []
-    parts = body.split(b"--" + boundary)
-
-    for part in parts:
+    for part in body.split(b"--" + boundary):
         if not part or part in (b"--\r\n", b"--", b"\r\n"):
             continue
-
         if b"\r\n\r\n" not in part:
             continue
-
         header_section, content = part.split(b"\r\n\r\n", 1)
         content = content.rstrip(b"\r\n")
-
-        headers: dict[str, str] = {}
+        headers = {}
         for line in header_section.split(b"\r\n"):
             if b": " in line:
-                key, val = line.split(b": ", 1)
-                headers[key.decode().lower()] = val.decode()
-
+                k, v = line.split(b": ", 1)
+                headers[k.decode().lower()] = v.decode()
         disposition = headers.get(HEADER_CONTENT_DISPOSITION, "")
         if MULTIPART_FILENAME_MARKER not in disposition:
             continue
-
         filename = disposition.split(MULTIPART_FILENAME_MARKER)[1].split('"')[0]
-        file_content_type = headers.get("content-type", CONTENT_TYPE_OCTET)
-
         files.append(
             {
                 "filename": filename,
-                "content_type": file_content_type,
+                "content_type": headers.get("content-type", CONTENT_TYPE_OCTET),
                 "content": content,
             }
         )
-
     return files
 
 
-UploadHandler = Callable[[list[UploadedFile]], ResponseDict]
+UploadHandler = Callable[[list[UploadedFile]], Response]
 
 
-def create_upload_handler(handler: UploadHandler) -> Callable[[Request], ResponseDict]:
-    """Create an upload endpoint handler for multipart file uploads."""
+def create_upload_handler(handler: UploadHandler) -> Callable[[Request], Response]:
+    """Wrap upload handler for multipart requests."""
 
-    def upload_handler(req: Request) -> ResponseDict:
-        content_type = req.headers.get(HEADER_CONTENT_TYPE, "")
-        if CONTENT_TYPE_MULTIPART not in content_type:
+    def wrapped(req: Request) -> Response:
+        ct = req.headers.get(HEADER_CONTENT_TYPE, "")
+        if CONTENT_TYPE_MULTIPART not in ct:
             return error(ERROR_EXPECTED_MULTIPART)
-
-        if MULTIPART_BOUNDARY_MARKER not in content_type:
+        if MULTIPART_BOUNDARY_MARKER not in ct:
             return error(ERROR_MISSING_BOUNDARY)
-
-        boundary = content_type.split(MULTIPART_BOUNDARY_MARKER)[1].strip().encode()
+        boundary = ct.split(MULTIPART_BOUNDARY_MARKER)[1].strip().encode()
         if not isinstance(req.body, bytes):
             return error(ERROR_INVALID_BODY)
+        return handler(parse_multipart(req.body, boundary))
 
-        files = parse_multipart(req.body, boundary)
-        result: ResponseDict = handler(files)
-        return result
+    return wrapped
 
-    return upload_handler
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Router Factory (OpenAPI/GraphQL future-proof)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class RouteInfo:
+    """Route metadata for OpenAPI: tags, summary, description, deprecated."""
+
+    tags: list[str] = field(default_factory=list)
+    summary: str = ""
+    description: str = ""
+    deprecated: bool = False
+    operation_id: str = ""
+    responses: dict[int, str] = field(default_factory=dict)
+
+
+@dataclass
+class Router:
+    """Route group with prefix and shared metadata (OpenAPI-ready)."""
+
+    prefix: str = ""
+    tags: list[str] = field(default_factory=list)
+    _routes: list[tuple[str, str, Any, RouteInfo]] = field(default_factory=list)
+    _app: Any = None
+
+    def _build_path(self, path: str) -> str:
+        """Build full path from prefix and path."""
+        if path == "/":
+            return self.prefix or "/"
+        full = f"{self.prefix.rstrip('/')}/{path.lstrip('/')}"
+        return full.rstrip("/") if full != "/" else full
+
+    def _add(
+        self,
+        method: str,
+        path: str,
+        handler: Any,
+        *,
+        tags: list[str] | None = None,
+        summary: str = "",
+        description: str = "",
+        deprecated: bool = False,
+        operation_id: str = "",
+        responses: dict[int, str] | None = None,
+    ) -> Any:
+        """Register route with metadata."""
+        full_path = self._build_path(path)
+        info = RouteInfo(
+            tags=tags or self.tags.copy(),
+            summary=summary,
+            description=description,
+            deprecated=deprecated,
+            operation_id=operation_id or handler.__name__,
+            responses=responses or {},
+        )
+        self._routes.append((method, full_path, handler, info))
+        if self._app is not None:
+            self._app._register_route(method, full_path, handler)
+        return handler
+
+    def _decorator(
+        self,
+        method: str,
+        path: str,
+        tags: list[str] | None,
+        summary: str,
+        description: str,
+        deprecated: bool,
+        operation_id: str,
+        responses: dict[int, str] | None,
+    ) -> Callable[[Any], Any]:
+        """Create route decorator."""
+
+        def dec(fn: Any) -> Any:
+            return self._add(
+                method,
+                path,
+                fn,
+                tags=tags,
+                summary=summary,
+                description=description,
+                deprecated=deprecated,
+                operation_id=operation_id,
+                responses=responses,
+            )
+
+        return dec
+
+    def get(
+        self,
+        path: str,
+        *,
+        tags: list[str] | None = None,
+        summary: str = "",
+        description: str = "",
+        deprecated: bool = False,
+        operation_id: str = "",
+        responses: dict[int, str] | None = None,
+    ) -> Callable[[Any], Any]:
+        """GET route decorator."""
+        return self._decorator(
+            "GET",
+            path,
+            tags,
+            summary,
+            description,
+            deprecated,
+            operation_id,
+            responses,
+        )
+
+    def post(
+        self,
+        path: str,
+        *,
+        tags: list[str] | None = None,
+        summary: str = "",
+        description: str = "",
+        deprecated: bool = False,
+        operation_id: str = "",
+        responses: dict[int, str] | None = None,
+    ) -> Callable[[Any], Any]:
+        """POST route decorator."""
+        return self._decorator(
+            "POST",
+            path,
+            tags,
+            summary,
+            description,
+            deprecated,
+            operation_id,
+            responses,
+        )
+
+    def put(
+        self,
+        path: str,
+        *,
+        tags: list[str] | None = None,
+        summary: str = "",
+        description: str = "",
+        deprecated: bool = False,
+        operation_id: str = "",
+        responses: dict[int, str] | None = None,
+    ) -> Callable[[Any], Any]:
+        """PUT route decorator."""
+        return self._decorator(
+            "PUT",
+            path,
+            tags,
+            summary,
+            description,
+            deprecated,
+            operation_id,
+            responses,
+        )
+
+    def delete(
+        self,
+        path: str,
+        *,
+        tags: list[str] | None = None,
+        summary: str = "",
+        description: str = "",
+        deprecated: bool = False,
+        operation_id: str = "",
+        responses: dict[int, str] | None = None,
+    ) -> Callable[[Any], Any]:
+        """DELETE route decorator."""
+        return self._decorator(
+            "DELETE",
+            path,
+            tags,
+            summary,
+            description,
+            deprecated,
+            operation_id,
+            responses,
+        )
+
+    def patch(
+        self,
+        path: str,
+        *,
+        tags: list[str] | None = None,
+        summary: str = "",
+        description: str = "",
+        deprecated: bool = False,
+        operation_id: str = "",
+        responses: dict[int, str] | None = None,
+    ) -> Callable[[Any], Any]:
+        """PATCH route decorator."""
+        return self._decorator(
+            "PATCH",
+            path,
+            tags,
+            summary,
+            description,
+            deprecated,
+            operation_id,
+            responses,
+        )
+
+    def routes(self) -> list[tuple[str, str, Any, RouteInfo]]:
+        """Get all registered routes with metadata."""
+        return self._routes.copy()
+
+
+def router(prefix: str = "", *, tags: list[str] | None = None) -> Router:
+    """Create route group with prefix and tags (OpenAPI-ready)."""
+    return Router(prefix=prefix, tags=tags or [])

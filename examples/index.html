@@ -108,11 +108,33 @@
         .btn-group {
             margin-bottom: 20px;
         }
+
+        pre {
+            background: #111;
+            border: 1px solid #333;
+            padding: 16px;
+            overflow-x: auto;
+            color: #4f8;
+        }
+
+        h2 {
+            color: #4af;
+            margin-top: 30px;
+        }
     </style>
 </head>
 
 <body>
-    <h1>WebSocket Test</h1>
+    <h1>Pykrozen Demo</h1>
+
+    <h2>Internal Endpoints</h2>
+    <div class="btn-group">
+        <button onclick="fetchInternal('health')">/health</button>
+        <button onclick="fetchInternal('info')">/info</button>
+    </div>
+    <pre id="internal-result"></pre>
+
+    <h2>WebSocket Test</h2>
     <div id="status" class="status disconnected">Disconnected</div>
 
     <div class="btn-group">
@@ -132,6 +154,17 @@
     <script>
         let ws = null;
         const WS_URL = 'ws://localhost:8000/ws';
+
+        async function fetchInternal(endpoint) {
+            const result = document.getElementById('internal-result');
+            try {
+                const res = await fetch(`/_internal/${endpoint}`);
+                const data = await res.json();
+                result.textContent = JSON.stringify(data, null, 2);
+            } catch (e) {
+                result.textContent = 'Error: ' + e.message;
+            }
+        }
 
         function log(msg, type = '') {
             const log = document.getElementById('log');

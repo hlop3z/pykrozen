@@ -54,14 +54,14 @@ cargo run -- all
 With custom parameters:
 
 ```bash
-cargo run -- all --concurrency 200 --duration 30 --endpoints /,/health,/data
+cargo run -- all --concurrency 200 --duration 30 --endpoints /,/_internal/health,/data
 ```
 
 #### HTTP GET Tests
 
 ```bash
 cargo run -- get
-cargo run -- get --paths /,/health,/data,/echo
+cargo run -- get --paths /,/_internal/health,/data,/echo
 ```
 
 #### HTTP POST Tests

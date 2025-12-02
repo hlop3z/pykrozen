@@ -24,11 +24,14 @@ Server.run()
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [HTTP Routes](#http-routes)
+- [Route Groups (Router)](#route-groups-router)
 - [Middleware](#middleware)
 - [Hooks](#hooks)
 - [WebSocket](#websocket)
 - [Plugins](#plugins)
+- [Static Files](#static-files)
 - [Shared State](#shared-state)
+- [Built-in Endpoints](#built-in-endpoints)
 - [Type Reference](#type-reference)
 - [Performance](#performance)
 
@@ -46,7 +49,9 @@ from pykrozen import (
     App, Plugin,
     Request, Response,
     WSClient, WSMessage, WSContext,
-    app, get, post, on, use
+    app, get, post, on, use,
+    router, include_router, Router, RouteInfo,
+    static, file, clear_file_cache
 )
 ```
 
@@ -186,6 +191,123 @@ Route handlers return a dict with optional keys:
     "body": {"key": "value"},  # Response body (JSON serialized)
     "headers": {}              # Additional headers
 }
+```
+
+---
+
+## Route Groups (Router)
+
+Group routes by prefix with shared metadata (OpenAPI-ready).
+
+### Basic Usage
+
+```python
+from pykrozen import router, include_router, Request
+
+# Create a route group with prefix and tags
+api = router('/api/v1', tags=['api'])
+
+@api.get('/users')
+def list_users(req: Request):
+    return {'body': {'users': []}}
+
+@api.post('/users')
+def create_user(req: Request):
+    return {'body': {'id': 1}, 'status': 201}
+
+@api.get('/users/:id')
+def get_user(req: Request):
+    return {'body': {'id': req.params['id']}}
+
+# Register all routes with the app
+include_router(api)
+```
+
+Routes are registered at:
+
+- `GET /api/v1/users`
+- `POST /api/v1/users`
+- `GET /api/v1/users/:id`
+
+### OpenAPI Metadata
+
+Add metadata for future OpenAPI/GraphQL integration:
+
+```python
+users = router('/users', tags=['users'])
+
+@users.get(
+    '/',
+    summary='List all users',
+    description='Returns paginated list of users',
+    responses={200: 'Success', 401: 'Unauthorized'},
+)
+def list_users(req: Request):
+    return {'body': {'users': []}}
+
+@users.post(
+    '/',
+    summary='Create user',
+    deprecated=False,
+    operation_id='createUser',
+)
+def create_user(req: Request):
+    return {'body': {'id': 1}, 'status': 201}
+```
+
+### Multiple Routers
+
+Organize routes by domain:
+
+```python
+from pykrozen import router, include_router
+
+# User routes
+users = router('/api/users', tags=['users'])
+
+@users.get('/')
+def list_users(req): ...
+
+@users.get('/:id')
+def get_user(req): ...
+
+# Product routes
+products = router('/api/products', tags=['products'])
+
+@products.get('/')
+def list_products(req): ...
+
+@products.get('/:id')
+def get_product(req): ...
+
+# Register all
+include_router(users)
+include_router(products)
+```
+
+### Route Metadata Reference
+
+| Parameter      | Type            | Description                          |
+| -------------- | --------------- | ------------------------------------ |
+| `tags`         | `list[str]`     | Route categorization                 |
+| `summary`      | `str`           | Short description                    |
+| `description`  | `str`           | Detailed description                 |
+| `deprecated`   | `bool`          | Mark as deprecated                   |
+| `operation_id` | `str`           | Unique operation ID (defaults to fn) |
+| `responses`    | `dict[int,str]` | Response codes and descriptions      |
+
+### Accessing Route Metadata
+
+```python
+api = router('/api', tags=['api'])
+
+@api.get('/health', summary='Health check')
+def health(req):
+    return {'body': {'status': 'ok'}}
+
+# Get all routes with metadata
+for method, path, handler, info in api.routes():
+    print(f'{method} {path} - {info.summary} (tags: {info.tags})')
 ```
 
 ---
@@ -349,6 +471,83 @@ Server.run()
 
 ---
 
+## Static Files
+
+Serve static files like CSS, JavaScript, images, and other assets.
+
+### Serving a Directory
+
+Use the `static()` function to serve all files from a directory:
+
+```python
+from pykrozen import static, settings
+from pathlib import Path
+
+# Optional: set base directory (defaults to current working directory)
+settings.base_dir = Path("/path/to/your/project")
+
+# Serve files from {base_dir}/static/ at /assets/*
+static("/assets")
+```
+
+This maps URLs to files in the `static/` subdirectory of `base_dir`:
+
+| URL                      | File Path                  |
+| ------------------------ | -------------------------- |
+| `/assets/css/style.css`  | `./static/css/style.css`   |
+| `/assets/js/app.js`      | `./static/js/app.js`       |
+| `/assets/images/logo.png`| `./static/images/logo.png` |
+
+### Serving Individual Files
+
+Use the `file()` function for specific file routes:
+
+```python
+from pykrozen import get, file
+from pathlib import Path
+
+@get("/favicon.ico")
+def favicon(req):
+    return file(Path("static/favicon.ico"))
+
+@get("/robots.txt")
+def robots(req):
+    return file(Path("robots.txt"), content_type="text/plain")
+```
+
+The `file()` function:
+
+- Auto-detects MIME type from file extension
+- Returns 404 if the file doesn't exist
+- Accepts an optional `content_type` parameter to override detection
+
+### Caching
+
+Static files are cached in memory after the first request (lazy-loading). Use the `reload` parameter for files that change:
+
+```python
+# Cached (default) - good for production assets
+@get("/app.js")
+def app_js(req):
+    return file(Path("static/app.js"))
+
+# Always reload - good for development or dynamic files
+@get("/config.json")
+def config(req):
+    return file(Path("config.json"), reload=True)
+```
+
+To manually clear the cache:
+
+```python
+from pykrozen import clear_file_cache
+
+clear_file_cache()                      # Clear all cached files
+clear_file_cache("static/app.js")       # Clear specific file
+```
+
+---
+
 ## Shared State
 
 Use `app.state` for sharing data across handlers.
@@ -372,6 +571,41 @@ WebSocket clients have their own `data` namespace:
 def init_client(ctx: WSContext) -> None:
     ctx.ws.data.user_id = None
     ctx.ws.data.authenticated = False
+```
+
+---
+
+## Built-in Endpoints
+
+Pykrozen provides built-in endpoints under the `/_internal/` prefix. These never conflict with your routes.
+
+### Health Check
+
+```http
+GET /_internal/health
+```
+
+Returns server health status:
+
+```json
+{"status": "ok"}
+```
+
+### Server Info
+
+```http
+GET /_internal/info
+```
+
+Returns server information:
+
+```json
+{
+  "version": "0.1.0",
+  "python": "3.12.0",
+  "event_loop": "uvloop",
+  "plugins": ["auth", "logging"]
+}
 ```
 
 ---
@@ -419,6 +653,17 @@ class WSMessage:
     data: Any         # Parsed message data
     reply: Any        # Set to send response
     stop: bool        # Skip default echo
+```
+
+### file()
+
+```python
+def file(
+    filepath: Path,
+    content_type: str | None = None,  # Auto-detected if None
+    status: int = 200,
+    reload: bool = False,             # True = skip cache, always read from disk
+) -> ResponseDict: ...
 ```
 
 ---

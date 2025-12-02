@@ -42,30 +42,34 @@ from pykrozen.constants import (
     HTTPMethod,
     WSOpcode,
 )
+from pykrozen.files import clear_cache as clear_file_cache
+from pykrozen.files import file
 from pykrozen.http import (
     HTTPContext,
     Request,
     Response,
-    ResponseDict,
+    ResponseHTTP,
     Route,
+    RouteInfo,
+    Router,
     UploadedFile,
     create_upload_handler,
     error,
-    file,
     html,
     make_request,
     make_response,
     parse_query,
+    router,
     text,
 )
-from pykrozen.router import RadixRouter, RouteMatch
+from pykrozen.radix import RadixRouter, RouteMatch
 from pykrozen.utils import _json_dumps_cached, _json_loads
 from pykrozen.ws import AsyncWSClient, WSClient, WSContext, WSMessage
 
-# Platform-specific socket option (Unix only)
+__version__ = "0.1.0"
+
 SO_REUSEPORT: int | None = getattr(socket, "SO_REUSEPORT", None)
 
-# Pre-computed hook keys to avoid string operations per-request
 _HTTP_HOOK_KEYS: dict[str, str] = {
     HTTPMethod.GET: Hook.HTTP_GET,
     HTTPMethod.POST: Hook.HTTP_POST,
@@ -82,13 +86,13 @@ _HTTP_HOOK_KEYS: dict[str, str] = {
 
 @dataclass
 class Settings:
-    """Global server configuration. Modify before calling `Server.run()`."""
+    """Server configuration."""
 
     port: int = 8000
     host: str = "127.0.0.1"
     ws_path: str = "/ws"
     debug: bool = False
-    base_dir: Path = Path.cwd()
+    base_dir: Path = field(default_factory=Path.cwd)
     workers: int = 1
     backlog: int = 2048
     reuse_port: bool = True
@@ -98,7 +102,7 @@ settings = Settings()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Server Context
+# Contexts
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -112,28 +116,24 @@ class ServerContext:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Plugin Protocol
+# Type Aliases
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 class PluginProtocol(Protocol):
-    """Protocol for plugins. Implement `setup()` to register hooks/routes."""
+    """Plugin protocol: name + setup(app)."""
 
     name: str
 
     def setup(self, app: App) -> None: ...
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Type Aliases
-# ──────────────────────────────────────────────────────────────────────────────
-
-RouteResult = Response | ResponseDict | None
+RouteResult = ResponseHTTP | Response | None
 AsyncRouteResult = Coroutine[Any, Any, RouteResult]
-MiddlewareFn = Callable[[Request, Response], None]
+MiddlewareFn = Callable[[Request, ResponseHTTP], None]
 RouteHandler = Callable[[Request], RouteResult | AsyncRouteResult]
 HookHandler = Callable[[Any], None]
-UploadHandler = Callable[[list[UploadedFile]], ResponseDict]
+UploadHandler = Callable[[list[UploadedFile]], Response]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -143,31 +143,26 @@ UploadHandler = Callable[[list[UploadedFile]], ResponseDict]
 
 @dataclass
 class App:
-    """Application with routing, middleware, and hooks."""
+    """Application: routing, middleware, hooks, plugins."""
 
     _hooks: dict[str, list[HookHandler]] = field(default_factory=dict)
     _middleware: list[MiddlewareFn] = field(default_factory=list)
     _router: RadixRouter = field(default_factory=RadixRouter)
     _routes: dict[str, dict[str, RouteHandler]] = field(
-        default_factory=lambda: {
-            HTTPMethod.GET: {},
-            HTTPMethod.POST: {},
-            HTTPMethod.PUT: {},
-            HTTPMethod.DELETE: {},
-            HTTPMethod.PATCH: {},
-        }
+        default_factory=lambda: {m: {} for m in HTTPMethod}
     )
     _plugins: list[PluginProtocol] = field(default_factory=list)
+    _routers: list[Router] = field(default_factory=list)
     state: SimpleNamespace = field(default_factory=SimpleNamespace)
 
     def plugin(self, p: PluginProtocol) -> App:
-        """Register a plugin."""
+        """Register plugin."""
         self._plugins.append(p)
         p.setup(self)
         return self
 
     def on(self, event: str) -> Callable[[HookHandler], HookHandler]:
-        """Decorator to register an event hook."""
+        """Decorator: register event hook."""
 
         def decorator(fn: HookHandler) -> HookHandler:
             self._hooks.setdefault(event, []).append(fn)
@@ -176,22 +171,20 @@ class App:
         return decorator
 
     def use(self, fn: MiddlewareFn) -> MiddlewareFn:
-        """Register middleware. Runs on every HTTP request."""
+        """Register middleware."""
         self._middleware.append(fn)
         return fn
 
-    def _register_route(
-        self, method: HTTPMethod, path: str, fn: RouteHandler
-    ) -> RouteHandler:
-        """Register a route with both radix router and legacy dict."""
+    def _register_route(self, method: str, path: str, fn: RouteHandler) -> RouteHandler:
+        """Register route."""
         self._router.add(method, path, fn)
         self._routes.setdefault(method, {})[path] = fn
         return fn
 
-    def _make_route_decorator(
-        self, method: HTTPMethod, path: str
+    def _route_decorator(
+        self, method: str, path: str
     ) -> Callable[[RouteHandler], RouteHandler]:
-        """Create a route decorator for the given HTTP method."""
+        """Create route decorator."""
 
         def decorator(fn: RouteHandler) -> RouteHandler:
             return self._register_route(method, path, fn)
@@ -199,80 +192,86 @@ class App:
         return decorator
 
     def get(self, path: str) -> Callable[[RouteHandler], RouteHandler]:
-        """Decorator to register a GET route handler."""
-        return self._make_route_decorator(HTTPMethod.GET, path)
+        """GET route decorator."""
+        return self._route_decorator(HTTPMethod.GET, path)
 
     def post(self, path: str) -> Callable[[RouteHandler], RouteHandler]:
-        """Decorator to register a POST route handler."""
-        return self._make_route_decorator(HTTPMethod.POST, path)
+        """POST route decorator."""
+        return self._route_decorator(HTTPMethod.POST, path)
 
     def put(self, path: str) -> Callable[[RouteHandler], RouteHandler]:
-        """Decorator to register a PUT route handler."""
-        return self._make_route_decorator(HTTPMethod.PUT, path)
+        """PUT route decorator."""
+        return self._route_decorator(HTTPMethod.PUT, path)
 
     def delete(self, path: str) -> Callable[[RouteHandler], RouteHandler]:
-        """Decorator to register a DELETE route handler."""
-        return self._make_route_decorator(HTTPMethod.DELETE, path)
+        """DELETE route decorator."""
+        return self._route_decorator(HTTPMethod.DELETE, path)
 
     def patch(self, path: str) -> Callable[[RouteHandler], RouteHandler]:
-        """Decorator to register a PATCH route handler."""
-        return self._make_route_decorator(HTTPMethod.PATCH, path)
+        """PATCH route decorator."""
+        return self._route_decorator(HTTPMethod.PATCH, path)
+
+    def include_router(self, r: Router) -> App:
+        """Include Router, registering all its routes."""
+        r._app = self
+        self._routers.append(r)
+        for method, path, handler, _info in r._routes:
+            self._register_route(method, path, handler)
+        return self
 
     def emit(self, event: str, ctx: Any) -> Any:
-        """Emit an event to all registered hooks."""
+        """Emit event to hooks."""
         for fn in self._hooks.get(event, []):
             fn(ctx)
             if getattr(ctx, "stop", False):
                 break
         return ctx
 
-    def run_middleware(self, req: Request, res: Response) -> bool:
-        """Run all middleware. Returns False if chain was stopped."""
+    def run_middleware(self, req: Request, res: ResponseHTTP) -> bool:
+        """Run middleware chain. Returns False if stopped."""
         for fn in self._middleware:
             fn(req, res)
             if res.stop:
                 return False
         return True
 
-    def route(self, method: str, path: str, req: Request) -> ResponseDict | None:
-        """Find and execute a route handler using radix tree matching."""
+    def route(self, method: str, path: str, req: Request) -> Response | None:
+        """Match and execute route."""
         match = self._router.match_new(method, path)
         if not match.matched or match.handler is None:
             return None
-
         if match.params:
             req.params.update(match.params)
-
-        result = match.handler(req)
-        if isinstance(result, Response):
+        result: RouteResult = match.handler(req)
+        if isinstance(result, ResponseHTTP):
             return {
                 "status": result.status,
                 "body": result.body,
                 "headers": result.headers,
             }
-        response: ResponseDict | None = result
-        return response
+        return result
 
     def static(self, path_prefix: str) -> RouteHandler:
-        @get(f"{path_prefix}/*path")
-        def static_base(req: Request) -> ResponseDict:
-            path = req.params["path"]
-            return file(settings.base_dir / "static" / path)
+        """Register static file handler."""
 
-        return static_base
+        @self.get(f"{path_prefix}/*path")
+        def handler(req: Request) -> Response:
+            return file(settings.base_dir / "static" / req.params["path"])
+
+        return handler
 
 
 class Plugin:
-    """Base plugin class. Subclass and override `setup()`."""
+    """Base plugin class."""
 
     name: str = "plugin"
 
-    def setup(self, app: App) -> None:  # noqa: ARG002
-        """Override this method to register hooks/routes."""
-        raise NotImplementedError("Subclasses must implement setup()")
+    def setup(self, app: App) -> None:
+        """Override to register hooks/routes."""
+        raise NotImplementedError
 
 
-# Global app instance and convenience decorators
+# Global app and decorators
 app = App()
 on = app.on
 use = app.use
@@ -282,52 +281,80 @@ put = app.put
 delete = app.delete
 patch = app.patch
 static = app.static
+include_router = app.include_router
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Built-in Internal Endpoints
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@app.get("/_internal/health")
+def _internal_health(_req: Request) -> Response:
+    """Health check."""
+    return {"body": {"status": "ok"}, "status": 200}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Event Loop
+# ──────────────────────────────────────────────────────────────────────────────
+
+_LOOP_POLICY: str = "stdlib"
+
+
+@app.get("/_internal/info")
+def _internal_info(_req: Request) -> Response:
+    """Server info."""
+    vi = sys.version_info
+    return {
+        "body": {
+            "version": __version__,
+            "python": f"{vi.major}.{vi.minor}.{vi.micro}",
+            "event_loop": _LOOP_POLICY,
+            "plugins": [p.name for p in app._plugins],
+        },
+        "status": 200,
+    }
 
 
 def upload(path: str, handler: UploadHandler) -> None:
-    """Register an upload endpoint for multipart file uploads."""
+    """Register upload endpoint."""
     app._routes[HTTPMethod.POST][path] = create_upload_handler(handler)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# WebSocket Message Handling
+# WebSocket
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def _handle_ws_loop(ws: WSClient) -> None:
-    """Handle WebSocket message loop."""
-    app.emit(Hook.WS_CONNECT, WSContext(ws))
+def _process_ws_text(ws: WSClient | AsyncWSClient, data: bytes | str) -> None:
+    """Process WebSocket text message."""
+    try:
+        text_data = data.decode(ENCODING_UTF8) if isinstance(data, bytes) else data
+        msg = _json_loads(text_data)
+        ctx = WSMessage(ws=ws, data=msg, reply=None, stop=False)
+        app.emit(Hook.WS_MESSAGE, ctx)
+        if ctx.stop:
+            return
+        ws.send(ctx.reply if ctx.reply is not None else {WS_DEFAULT_ECHO_KEY: msg})
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+        ws.send({"error": WS_ERROR_INVALID_JSON})
 
+
+def _handle_ws_loop(ws: WSClient) -> None:
+    """Sync WebSocket message loop."""
+    app.emit(Hook.WS_CONNECT, WSContext(ws))
     try:
         while True:
             opcode, data = ws.recv()
-
             if opcode is None or opcode == WSOpcode.CLOSE:
                 ws.send(b"", WSOpcode.CLOSE)
                 break
-
             if opcode == WSOpcode.PING:
                 ws.send(data or b"", WSOpcode.PONG)
                 continue
-
             if opcode == WSOpcode.TEXT and data is not None:
-                try:
-                    text_data = (
-                        data.decode(ENCODING_UTF8) if isinstance(data, bytes) else data
-                    )
-                    msg = _json_loads(text_data)
-                    ctx = WSMessage(ws=ws, data=msg, reply=None, stop=False)
-                    app.emit(Hook.WS_MESSAGE, ctx)
-
-                    if ctx.stop:
-                        continue
-                    if ctx.reply is not None:
-                        ws.send(ctx.reply)
-                    else:
-                        ws.send({WS_DEFAULT_ECHO_KEY: msg})
-                except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
-                    ws.send({"error": WS_ERROR_INVALID_JSON})
-
+                _process_ws_text(ws, data)
     except (ConnectionResetError, BrokenPipeError, OSError):
         pass
     finally:
@@ -336,45 +363,26 @@ def _handle_ws_loop(ws: WSClient) -> None:
 
 
 def handle_ws_upgrade(sock: socket.socket, ws_key: str) -> None:
-    """Handle WebSocket upgrade from HTTP."""
+    """Handle WebSocket upgrade."""
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFFER_SYNC)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUFFER_SYNC)
-
     ws = WSClient(sock)
     ws.handshake_with_key(ws_key)
     _handle_ws_loop(ws)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Event Loop Selection
-# ──────────────────────────────────────────────────────────────────────────────
-
-_LOOP_POLICY: str = "stdlib"
-
-
 def _setup_event_loop() -> None:
-    """Set up the best available event loop policy."""
+    """Setup best available event loop."""
     global _LOOP_POLICY
-
-    try:
-        import uvloop
-
-        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-        _LOOP_POLICY = "uvloop"
-        return
-    except ImportError:
-        pass
-
-    try:
-        import winloop
-
-        asyncio.set_event_loop_policy(winloop.EventLoopPolicy())
-        _LOOP_POLICY = "winloop"
-        return
-    except ImportError:
-        pass
-
+    for name, module in [("uvloop", "uvloop"), ("winloop", "winloop")]:
+        try:
+            loop_mod = __import__(module)
+            asyncio.set_event_loop_policy(loop_mod.EventLoopPolicy())
+            _LOOP_POLICY = name
+            return
+        except ImportError:
+            pass
     _LOOP_POLICY = "stdlib"
 
 
@@ -384,7 +392,7 @@ def _setup_event_loop() -> None:
 
 
 class AsyncHTTPProtocol(asyncio.Protocol):
-    """High-performance asyncio HTTP protocol handler."""
+    """Asyncio HTTP protocol handler."""
 
     def __init__(self) -> None:
         self.transport: asyncio.Transport | None = None
@@ -399,71 +407,46 @@ class AsyncHTTPProtocol(asyncio.Protocol):
         sock = transport.get_extra_info("socket")
         if sock:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            try:
+            with contextlib.suppress(OSError):
                 sock.setsockopt(
                     socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFFER_ASYNC
                 )
                 sock.setsockopt(
                     socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUFFER_ASYNC
                 )
-            except OSError:
-                pass  # Not all platforms support buffer resizing
 
     def connection_lost(self, exc: Exception | None) -> None:
+        del exc  # unused but required by Protocol
         self.transport = None
 
     async def _ws_message_loop(self, ws: AsyncWSClient) -> None:
-        """Handle WebSocket message loop asynchronously."""
+        """Async WebSocket message loop."""
         while True:
             opcode, data = await ws.recv_async()
-
             if opcode is None or opcode == WSOpcode.CLOSE:
                 ws.send(b"", WSOpcode.CLOSE)
                 break
-
             if opcode == WSOpcode.PING:
                 ws.send(data or b"", WSOpcode.PONG)
                 continue
-
             if opcode == WSOpcode.TEXT and data is not None:
-                try:
-                    text_data = (
-                        data.decode(ENCODING_UTF8) if isinstance(data, bytes) else data
-                    )
-                    msg = _json_loads(text_data)
-                    ctx = WSMessage(ws=ws, data=msg, reply=None, stop=False)
-                    app.emit(Hook.WS_MESSAGE, ctx)
+                _process_ws_text(ws, data)
 
-                    if ctx.stop:
-                        continue
-                    if ctx.reply is not None:
-                        ws.send(ctx.reply)
-                    else:
-                        ws.send({WS_DEFAULT_ECHO_KEY: msg})
-                except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
-                    ws.send({"error": WS_ERROR_INVALID_JSON})
-
-    async def _handle_websocket(self, ws_key: str, headers: dict[str, str]) -> None:
-        """Handle WebSocket upgrade asynchronously."""
+    async def _handle_websocket(self, ws_key: str) -> None:
+        """Handle WebSocket upgrade."""
         if not self.transport:
             return
-
         accept = b64encode(sha1(ws_key.encode() + WS_MAGIC).digest()).decode()
-        response = (
-            "HTTP/1.1 101 Switching Protocols\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+        self.transport.write(
+            f"HTTP/1.1 101 Switching Protocols\r\n"
+            f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n\r\n".encode()
         )
-        self.transport.write(response.encode())
-
         ws = AsyncWSClient(self.transport)
         ws.data = SimpleNamespace()
         self._ws_client = ws
         self._ws_mode = True
-
         app.emit(Hook.WS_CONNECT, WSContext(ws))
-
         try:
             await self._ws_message_loop(ws)
         except (ConnectionResetError, BrokenPipeError, OSError, asyncio.CancelledError):
@@ -476,11 +459,10 @@ class AsyncHTTPProtocol(asyncio.Protocol):
             if self.transport and not self.transport.is_closing():
                 self.transport.close()
 
-    def _send_response(self, res: Response) -> None:
-        """Send HTTP response using pre-built headers for speed."""
+    def _send_response(self, res: ResponseHTTP) -> None:
+        """Send HTTP response."""
         if not self.transport:
             return
-
         content_type = res.headers.get(HEADER_CONTENT_TYPE)
         is_json = content_type is None or content_type == CONTENT_TYPE_JSON
         if is_json:
@@ -497,33 +479,28 @@ class AsyncHTTPProtocol(asyncio.Protocol):
             status_line = f"HTTP/1.1 {res.status} {status_text}\r\n".encode()
 
         parts = [status_line]
-
         if is_json:
             parts.append(HEADER_JSON_BYTES)
         else:
             parts.append(f"Content-Type: {content_type}\r\n".encode())
-
         parts.append(f"Content-Length: {len(body)}\r\n".encode())
-
         for k, v in res.headers.items():
             if k != HEADER_CONTENT_TYPE:
                 parts.append(f"{k}: {v}\r\n".encode())
-
         parts.append(HEADER_KEEPALIVE_BYTES if self.keep_alive else HEADER_CLOSE_BYTES)
         parts.append(b"\r\n")
         parts.append(body)
-
         self.transport.write(b"".join(parts))
 
     async def _handle_request(
         self, method: str, path: str, headers: dict[str, str], body_data: bytes
     ) -> None:
-        """Handle HTTP request asynchronously."""
+        """Handle HTTP request."""
         if not self.transport:
             return
-
         path_clean, query = parse_query(path)
 
+        # Parse body
         content_type = headers.get(HEADER_CONTENT_TYPE, "")
         if CONTENT_TYPE_MULTIPART in content_type:
             body: Any = body_data
@@ -538,54 +515,48 @@ class AsyncHTTPProtocol(asyncio.Protocol):
         req = Request(
             method=method, path=path_clean, headers=headers, query=query, body=body
         )
-        res = Response(status=200, body={}, headers={}, stop=False)
+        res = ResponseHTTP(status=200, body={}, headers={}, stop=False)
 
+        # Middleware
         for mw in app._middleware:
             mw(req, res)
             if res.stop:
                 self._send_response(res)
                 return
 
+        # Pre-hooks
         hook_key = _HTTP_HOOK_KEYS.get(method)
         if hook_key:
-            hooks = app._hooks.get(hook_key)
-            if hooks:
-                ctx = HTTPContext(req, res)
-                for fn in hooks:
-                    fn(ctx)
-                    if res.stop:
-                        self._send_response(res)
-                        return
+            for fn in app._hooks.get(hook_key, []):
+                fn(HTTPContext(req, res))
+                if res.stop:
+                    self._send_response(res)
+                    return
 
+        # Route matching
         match = app._router.match_new(method, path_clean)
         if match.matched and match.handler is not None:
             if match.params:
                 req.params.update(match.params)
-
             result = match.handler(req)
             if inspect.iscoroutine(result):
                 result = await result
-
             if result:
-                if isinstance(result, Response):
-                    res.status = result.status
-                    res.body = result.body
+                if isinstance(result, ResponseHTTP):
+                    res.status, res.body = result.status, result.body
                     res.headers.update(result.headers)
                 else:
                     res.status = result.get("status", res.status)
                     res.body = result.get("body", res.body)
-                    h = result.get("headers")
-                    if h:
+                    if h := result.get("headers"):
                         res.headers.update(h)
         elif not res.body:
             res.body = {"method": method, "path": path_clean}
 
+        # Post-hooks
         if hook_key:
-            after_hooks = app._hooks.get(hook_key + HOOK_AFTER_SUFFIX)
-            if after_hooks:
-                ctx = HTTPContext(req, res)
-                for fn in after_hooks:
-                    fn(ctx)
+            for fn in app._hooks.get(hook_key + HOOK_AFTER_SUFFIX, []):
+                fn(HTTPContext(req, res))
 
         self._send_response(res)
 
@@ -594,61 +565,51 @@ class AsyncHTTPProtocol(asyncio.Protocol):
         if self.transport:
             status_text = HTTP_STATUS.get(status, "Error")
             body = f'{{"error":"{status_text}"}}'
-            response = (
+            self.transport.write(
                 f"HTTP/1.1 {status} {status_text}\r\n"
                 f"Content-Type: {CONTENT_TYPE_JSON}\r\n"
                 f"Content-Length: {len(body)}\r\n"
-                "Connection: close\r\n\r\n"
-                f"{body}"
+                f"Connection: close\r\n\r\n{body}".encode()
             )
-            self.transport.write(response.encode())
             self.transport.close()
 
     def _process_buffer(self) -> None:
-        """Process buffered data for complete HTTP requests."""
+        """Process HTTP requests from buffer."""
         while b"\r\n\r\n" in self.buffer:
             header_end = self.buffer.find(b"\r\n\r\n")
             if header_end == -1:
                 return
-
             header_data = bytes(self.buffer[:header_end])
             body_start = header_end + 4
-
             lines = header_data.split(b"\r\n")
             if not lines:
                 self._send_error(400)
                 return
-
-            request_line = lines[0].decode("latin-1")
-            parts = request_line.split(" ", 2)
+            parts = lines[0].decode("latin-1").split(" ", 2)
             if len(parts) != 3:
                 self._send_error(400)
                 return
-
             method, path, _ = parts
-
-            headers: dict[str, str] = {}
+            headers = {}
             for line in lines[1:]:
                 if b": " in line:
-                    key, val = line.split(b": ", 1)
-                    headers[key.decode("latin-1")] = val.decode("latin-1")
+                    k, v = line.split(b": ", 1)
+                    headers[k.decode("latin-1")] = v.decode("latin-1")
 
-            ws_upgrade = headers.get("Upgrade", "").lower() == "websocket"
-            if path == settings.ws_path and ws_upgrade:
+            # WebSocket upgrade
+            is_ws = headers.get("Upgrade", "").lower() == "websocket"
+            if path == settings.ws_path and is_ws:
                 ws_key = headers.get("Sec-WebSocket-Key")
                 if ws_key and self.transport:
                     del self.buffer[:body_start]
-                    asyncio.create_task(self._handle_websocket(ws_key, headers))
+                    asyncio.create_task(self._handle_websocket(ws_key))
                     return
 
             content_length = int(headers.get("Content-Length", "0"))
-
             if len(self.buffer) < body_start + content_length:
                 return
-
             body_data = bytes(self.buffer[body_start : body_start + content_length])
             del self.buffer[: body_start + content_length]
-
             self.request_count += 1
             asyncio.create_task(self._handle_request(method, path, headers, body_data))
 
@@ -660,10 +621,14 @@ class AsyncHTTPProtocol(asyncio.Protocol):
         self._process_buffer()
 
 
-async def _run_async_server(host: str, port: int) -> None:
-    """Run the async HTTP server."""
-    loop = asyncio.get_event_loop()
+# ──────────────────────────────────────────────────────────────────────────────
+# Server
+# ──────────────────────────────────────────────────────────────────────────────
 
+
+async def _run_async_server(host: str, port: int) -> None:
+    """Run async server."""
+    loop = asyncio.get_event_loop()
     server = await loop.create_server(
         AsyncHTTPProtocol,
         host,
@@ -672,45 +637,53 @@ async def _run_async_server(host: str, port: int) -> None:
         reuse_port=SO_REUSEPORT is not None and settings.reuse_port,
         backlog=settings.backlog,
     )
-
     if settings.debug:
         print(f"[AsyncServer] http://{host}:{port} (event loop: {_LOOP_POLICY})")
         print(f"[WebSocket] ws://{host}:{port}{settings.ws_path}")
-
     async with server:
         await server.serve_forever()
 
 
 def _async_worker_process(host: str, port: int, worker_id: int) -> None:
-    """Worker process running async server."""
+    """Worker process."""
     _setup_event_loop()
     if settings.debug:
-        print(f"[Worker {worker_id}] Starting async server on {host}:{port}")
+        print(f"[Worker {worker_id}] Starting on {host}:{port}")
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(_run_async_server(host, port))
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Server
-# ──────────────────────────────────────────────────────────────────────────────
-
-
 @dataclass
 class Server:
-    """HTTP + WebSocket server with start/stop lifecycle and multiprocessing."""
+    """HTTP + WebSocket server."""
 
     _running: bool = field(default=False, repr=False)
     _workers: list[multiprocessing.Process] = field(default_factory=list, repr=False)
+    _loop: asyncio.AbstractEventLoop | None = field(default=None, repr=False)
+    _server: asyncio.AbstractServer | None = field(default=None, repr=False)
+
+    async def _run_managed(self, host: str, port: int) -> None:
+        """Run with managed lifecycle."""
+        self._server = await self._loop.create_server(  # type: ignore[union-attr]
+            AsyncHTTPProtocol,
+            host,
+            port,
+            reuse_address=True,
+            reuse_port=SO_REUSEPORT is not None and settings.reuse_port,
+            backlog=settings.backlog,
+        )
+        if settings.debug:
+            print(f"[AsyncServer] http://{host}:{port} (event loop: {_LOOP_POLICY})")
+            print(f"[WebSocket] ws://{host}:{port}{settings.ws_path}")
+        async with self._server:
+            await self._server.serve_forever()
 
     def start(self) -> None:
-        """Start the server with optional worker processes."""
+        """Start server."""
         self._running = True
         app.emit(Hook.SERVER_START, ServerContext(self))
-
-        num_workers = settings.workers
-
-        if num_workers > 1 and sys.platform != "win32":
-            for i in range(num_workers):
+        if settings.workers > 1 and sys.platform != "win32":
+            for i in range(settings.workers):
                 p = multiprocessing.Process(
                     target=_async_worker_process,
                     args=(settings.host, settings.port, i),
@@ -720,18 +693,23 @@ class Server:
                 self._workers.append(p)
         else:
             _setup_event_loop()
+            self._loop = asyncio.new_event_loop()
 
-            def run_async() -> None:
-                with contextlib.suppress(KeyboardInterrupt):
-                    asyncio.run(_run_async_server(settings.host, settings.port))
+            def run() -> None:
+                asyncio.set_event_loop(self._loop)
+                with contextlib.suppress(KeyboardInterrupt, asyncio.CancelledError):
+                    self._loop.run_until_complete(  # type: ignore[union-attr]
+                        self._run_managed(settings.host, settings.port)
+                    )
 
-            threading.Thread(target=run_async, daemon=True).start()
+            threading.Thread(target=run, daemon=True).start()
 
     def stop(self) -> None:
-        """Stop the server and all workers."""
+        """Stop server."""
         self._running = False
+        if self._server is not None and self._loop is not None:
+            self._loop.call_soon_threadsafe(self._server.close)
         app.emit(Hook.SERVER_STOP, ServerContext(self))
-
         for p in self._workers:
             p.terminate()
             p.join(timeout=1)
@@ -739,14 +717,12 @@ class Server:
 
     @staticmethod
     def run(plugin: list[Plugin] | None = None) -> None:
-        """Start the server using global settings, optionally with plugins."""
+        """Run server with optional plugins."""
         if plugin:
             for p in plugin:
                 app.plugin(p)
-
         server = Server()
         server.start()
-
         try:
             while server._running:
                 threading.Event().wait(SERVER_MAIN_THREAD_WAIT)
@@ -756,7 +732,10 @@ class Server:
             server.stop()
 
 
-__version__ = "0.1.0"
+# ──────────────────────────────────────────────────────────────────────────────
+# Exports
+# ──────────────────────────────────────────────────────────────────────────────
+
 __all__ = [
     "__version__",
     # Enums
@@ -767,7 +746,7 @@ __all__ = [
     "CONTENT_TYPE_HTML",
     "CONTENT_TYPE_TEXT",
     "CONTENT_TYPE_OCTET",
-    # Core classes
+    # Core
     "Server",
     "Settings",
     "settings",
@@ -775,19 +754,25 @@ __all__ = [
     "Plugin",
     # Request/Response
     "Request",
+    "ResponseHTTP",
     "Response",
-    "ResponseDict",
     "UploadedFile",
     # WebSocket
     "WSClient",
     "AsyncWSClient",
     "WSMessage",
     "WSContext",
-    # Context types
+    # Context
     "HTTPContext",
     "ServerContext",
     "Route",
-    # Global app and decorators
+    # Router
+    "Router",
+    "RouteInfo",
+    "router",
+    "RadixRouter",
+    "RouteMatch",
+    # Global decorators
     "app",
     "get",
     "post",
@@ -797,7 +782,8 @@ __all__ = [
     "on",
     "use",
     "static",
-    # Factory functions
+    "include_router",
+    # Factories
     "make_request",
     "make_response",
     # Response helpers
@@ -806,13 +792,11 @@ __all__ = [
     "error",
     "file",
     "upload",
+    "clear_file_cache",
     # Type aliases
     "MiddlewareFn",
     "RouteHandler",
     "HookHandler",
     "UploadHandler",
     "PluginProtocol",
-    # Router
-    "RadixRouter",
-    "RouteMatch",
 ]
