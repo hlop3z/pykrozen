@@ -45,7 +45,7 @@ packages = ["src/pykrozen"]
 
 [tool.pyright]
 pythonVersion = "3.12"
-reportMissingImports = "warning"
+reportMissingImports = "none"
 
 [tool.mypy]
 python_version = "3.12"
@@ -83,6 +83,10 @@ disable = [
     "consider-using-enumerate",      # C0200: XOR loop is performance-critical
     "unused-argument",               # W0613: ws argument is required for interface compatibility
     "no-member",                     # E1101: orjson C extension members not visible to pylint
+    "too-many-instance-attributes",  # R0902: Settings dataclass needs multiple attributes
+    "global-statement",              # W0603: Global state for buffer pool and event loop policy
+    "too-many-return-statements",    # R0911: WebSocket recv has multiple exit points by design
+    "import-outside-toplevel",       # C0415: uvloop/winloop are optional runtime imports
 ]
 
 [dependency-groups]

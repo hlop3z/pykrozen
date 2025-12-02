@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 import multiprocessing
@@ -16,10 +17,9 @@ from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from enum import Enum
 from hashlib import sha1
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, NamedTuple, Protocol, TypedDict
+from typing import Any, NamedTuple, Protocol, TypedDict, cast
 
 from pykrozen.router import RadixRouter, RouteMatch
 
@@ -79,7 +79,6 @@ class Settings:
                  (default: 1, single-process mode)
         backlog: Socket listen backlog for pending connections (default: 2048)
         reuse_port: Enable SO_REUSEPORT socket option (default: True)
-        use_async: Use asyncio-based server for better performance (default: True)
 
     Example:
         >>> from pykrozen import settings, Server
@@ -97,7 +96,6 @@ class Settings:
     workers: int = 1  # Number of worker processes (1 = single process)
     backlog: int = 2048  # Socket listen backlog
     reuse_port: bool = True  # Enable SO_REUSEPORT for load balancing
-    use_async: bool = True  # Use asyncio-based server (faster)
 
 
 # Global settings instance
@@ -154,7 +152,7 @@ def _json_dumps_cached(obj: Any) -> bytes:
                 if len(_CACHED_RESPONSES) >= _CACHE_MAX_SIZE:
                     # Keep newest half (Python 3.7+ dicts maintain insertion order)
                     keys = list(_CACHED_RESPONSES.keys())
-                    for k in keys[:len(keys) // 2]:
+                    for k in keys[: len(keys) // 2]:
                         del _CACHED_RESPONSES[k]
                 _CACHED_RESPONSES[key] = result
             return result
@@ -181,9 +179,9 @@ def _xor_unmask_fast(payload: bytearray, mask: bytes) -> bytes:
     i = 0
     chunks = length // 8
     for _ in range(chunks):
-        chunk_int = int.from_bytes(payload[i:i+8], "little")
+        chunk_int = int.from_bytes(payload[i : i + 8], "little")
         result_int = chunk_int ^ mask_int
-        payload[i:i+8] = result_int.to_bytes(8, "little")
+        payload[i : i + 8] = result_int.to_bytes(8, "little")
         i += 8
 
     # Handle remaining bytes
@@ -203,32 +201,6 @@ _HTTP_HOOK_KEYS: dict[str, str] = {
     HTTPMethod.DELETE: "http:delete",
     HTTPMethod.PATCH: "http:patch",
 }
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Async Support
-# ──────────────────────────────────────────────────────────────────────────────
-
-# Thread-local event loop for running async handlers in sync context
-_thread_local = threading.local()
-
-
-def _get_event_loop() -> asyncio.AbstractEventLoop:
-    """Get or create an event loop for the current thread."""
-    try:
-        loop = getattr(_thread_local, "loop", None)
-        if loop is None or loop.is_closed():
-            loop = asyncio.new_event_loop()
-            _thread_local.loop = loop
-        return loop
-    except Exception:
-        return asyncio.new_event_loop()
-
-
-def _run_sync(coro: Coroutine[Any, Any, Any]) -> Any:
-    """Run a coroutine synchronously in the current thread."""
-    loop = _get_event_loop()
-    return loop.run_until_complete(coro)
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Type Definitions
@@ -450,7 +422,7 @@ class AsyncWSClient:
             # Use wait_for with short timeout to check connection state
             try:
                 await asyncio.wait_for(self._data_event.wait(), timeout=0.1)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
         return True
 
@@ -470,12 +442,16 @@ class AsyncWSClient:
             if length == 126:
                 if not await self._wait_for_bytes(offset + 2):
                     return None, None
-                length = struct.unpack(">H", bytes(self._buffer[offset:offset + 2]))[0]
+                length = struct.unpack(">H", bytes(self._buffer[offset : offset + 2]))[
+                    0
+                ]
                 offset += 2
             elif length == 127:
                 if not await self._wait_for_bytes(offset + 8):
                     return None, None
-                length = struct.unpack(">Q", bytes(self._buffer[offset:offset + 8]))[0]
+                length = struct.unpack(">Q", bytes(self._buffer[offset : offset + 8]))[
+                    0
+                ]
                 offset += 8
 
             # Mask
@@ -484,15 +460,15 @@ class AsyncWSClient:
             if masked:
                 if not await self._wait_for_bytes(offset + 4):
                     return None, None
-                mask = bytes(self._buffer[offset:offset + 4])
+                mask = bytes(self._buffer[offset : offset + 4])
                 offset += 4
 
             # Payload
             if not await self._wait_for_bytes(offset + length):
                 return None, None
 
-            payload = bytes(self._buffer[offset:offset + length])
-            del self._buffer[:offset + length]
+            payload = bytes(self._buffer[offset : offset + length])
+            del self._buffer[: offset + length]
 
             # Unmask if needed
             if masked and mask:
@@ -553,7 +529,7 @@ class WSMessage:
 
     def __init__(
         self,
-        ws: WSClient,
+        ws: WSClient | AsyncWSClient,
         data: Any = None,
         reply: Any = None,
         stop: bool = False,
@@ -726,9 +702,9 @@ class App:
         response: ResponseDict | None = result
         return response
 
-    def static(self, path_prefix: str):
+    def static(self, path_prefix: str) -> RouteHandler:
         @get(f"{path_prefix}/*path")
-        def static_base(req):
+        def static_base(req: Request) -> ResponseDict:
             path = req.params["path"]
             return file(settings.base_dir / "static" / path)
 
@@ -994,206 +970,6 @@ def handle_ws_upgrade(sock: socket.socket, ws_key: str) -> None:
     _handle_ws_loop(ws)
 
 
-class HTTPHandler(BaseHTTPRequestHandler):
-    """HTTP request handler with middleware and routing."""
-
-    # Disable Nagle's algorithm for lower latency
-    disable_nagle_algorithm = True
-
-    # Protocol version for keep-alive support
-    protocol_version = "HTTP/1.1"
-
-    # Increase buffer sizes for throughput
-    rbufsize = 131072  # 128KB read buffer
-    wbufsize = 131072  # 128KB write buffer
-
-    # Pre-built status messages to avoid string formatting
-    responses = {
-        200: ("OK", "Request fulfilled"),
-        201: ("Created", "Resource created"),
-        204: ("No Content", ""),
-        400: ("Bad Request", ""),
-        404: ("Not Found", ""),
-        500: ("Internal Server Error", ""),
-    }
-
-    # Flag to prevent close after WebSocket upgrade
-    _ws_upgraded = False
-
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
-        pass
-
-    def log_error(self, format: str, *args: Any) -> None:  # noqa: A002
-        """Suppress error logging for cleaner output during stress testing."""
-        pass
-
-    def handle_one_request(self) -> None:
-        """Handle a single HTTP request, suppressing broken pipe errors."""
-        try:
-            super().handle_one_request()
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-            pass
-
-    def finish(self) -> None:
-        """Override finish to skip cleanup if WebSocket upgraded."""
-        if not self._ws_upgraded:
-            try:
-                super().finish()
-            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-                pass
-
-    def _serve_html(self, filepath: str) -> bool:
-        """Serve an HTML file, returns True if served."""
-        try:
-            with open(filepath, "rb") as f:
-                content = f.read()
-            self.send_response(200)
-            self.send_header("Content-Type", CONTENT_TYPE_HTML)
-            self.send_header("Content-Length", str(len(content)))
-            self.end_headers()
-            self.wfile.write(content)
-            return True
-        except FileNotFoundError:
-            return False
-
-    def _respond(self, res: Response) -> None:
-        # Fast path for JSON responses (most common)
-        res_headers = res.headers
-        content_type = res_headers.get("Content-Type")
-        res_body = res.body
-
-        if content_type is None:
-            body = _json_dumps_cached(res_body)
-            content_type = CONTENT_TYPE_JSON
-        elif content_type == CONTENT_TYPE_JSON:
-            body = _json_dumps_cached(res_body)
-        elif isinstance(res_body, bytes):
-            body = res_body
-        else:
-            body = str(res_body).encode()
-
-        # Use standard BaseHTTPRequestHandler methods (well-optimized)
-        self.send_response(res.status)
-        for k, v in res_headers.items():
-            if k != "Content-Type":
-                self.send_header(k, v)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _handle(self, method: HTTPMethod, body: Any = None) -> None:
-        path, query = parse_query(self.path)
-        # Avoid dict() constructor - direct attribute access is faster
-        headers = {k: v for k, v in self.headers.items()}
-        req = Request(
-            method=method,
-            path=path,
-            headers=headers,
-            query=query,
-            body=body,
-        )
-        res = Response(status=200, body={}, headers={}, stop=False)
-
-        # Run middleware - cache reference for speed
-        middleware = app._middleware
-        if middleware:
-            for mw in middleware:
-                mw(req, res)
-                if res.stop:
-                    self._respond(res)
-                    return
-
-        # Pre-hook - use pre-computed keys
-        hook_key = _HTTP_HOOK_KEYS.get(method)
-        ctx: HTTPContext | None = None  # Lazy initialization
-        if hook_key:
-            hooks = app._hooks.get(hook_key)
-            if hooks:
-                ctx = HTTPContext(req, res)
-                for fn in hooks:
-                    fn(ctx)
-                    if res.stop:
-                        self._respond(res)
-                        return
-
-        # Route lookup using radix tree router (supports :param and *wildcard)
-        match = app._router.match_new(method, path)
-        if match.matched and match.handler is not None:
-            # Attach extracted parameters to request
-            if match.params:
-                req.params.update(match.params)
-
-            # Call handler - supports both sync and async
-            result = match.handler(req)
-            # If result is a coroutine, run it synchronously
-            if inspect.iscoroutine(result):
-                result = _run_sync(result)
-
-            if result:
-                if isinstance(result, Response):
-                    res.status = result.status
-                    res.body = result.body
-                    res.headers.update(result.headers)
-                else:
-                    # Use .get() with defaults to avoid multiple checks
-                    res.status = result.get("status", res.status)
-                    res.body = result.get("body", res.body)
-                    headers = result.get("headers")
-                    if headers:
-                        res.headers.update(headers)
-        elif not res.body:
-            res.body = {"method": method, "path": path}
-
-        # Post-hook - reuse ctx if already created
-        if hook_key:
-            after_hooks = app._hooks.get(hook_key + ":after")
-            if after_hooks:
-                if ctx is None:
-                    ctx = HTTPContext(req, res)
-                for fn in after_hooks:
-                    fn(ctx)
-
-        self._respond(res)
-
-    def do_GET(self) -> None:
-        # Check for WebSocket upgrade on configured path
-        path = self.path.split("?")[0]  # Remove query string
-        if path == settings.ws_path:
-            upgrade = self.headers.get("Upgrade", "").lower()
-            if upgrade == "websocket":
-                ws_key = self.headers.get("Sec-WebSocket-Key")
-                if ws_key:
-                    # Mark as upgraded to prevent HTTP cleanup
-                    self._ws_upgraded = True
-                    # Handle WebSocket on this thread (blocking)
-                    handle_ws_upgrade(self.connection, ws_key)
-                    return
-
-        # Serve index.html on root path
-        if self.path in ("/", "/index.html"):
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            if self._serve_html(os.path.join(script_dir, "index.html")):
-                return
-        self._handle(HTTPMethod.GET)
-
-    def do_POST(self) -> None:
-        content_length = self.headers.get("Content-Length")
-        raw = self.rfile.read(int(content_length)) if content_length else b""
-        content_type = self.headers.get("Content-Type", "")
-
-        # Keep raw bytes for multipart uploads
-        if "multipart/form-data" in content_type:
-            body: Any = raw
-        else:
-            try:
-                body = _json_loads(raw)
-            except (json.JSONDecodeError, ValueError):
-                body = raw.decode() if raw else ""
-
-        self._handle(HTTPMethod.POST, body)
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Event Loop Selection (uvloop/winloop if available)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1208,6 +984,7 @@ def _setup_event_loop() -> None:
     # Try uvloop first (Unix) - 2-4x faster than stdlib
     try:
         import uvloop
+
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
         _LOOP_POLICY = "uvloop"
         return
@@ -1217,6 +994,7 @@ def _setup_event_loop() -> None:
     # Try winloop (Windows) - uvloop port for Windows
     try:
         import winloop
+
         asyncio.set_event_loop_policy(winloop.EventLoopPolicy())
         _LOOP_POLICY = "winloop"
         return
@@ -1258,18 +1036,16 @@ _HEADER_CLOSE = b"Connection: close\r\n"
 class AsyncHTTPProtocol(asyncio.Protocol):
     """High-performance asyncio HTTP protocol handler."""
 
-    __slots__ = ("transport", "buffer", "keep_alive", "request_count", "_ws_client", "_ws_mode")
-
     def __init__(self) -> None:
         self.transport: asyncio.Transport | None = None
-        self.buffer = bytearray()
-        self.keep_alive = True
-        self.request_count = 0
+        self.buffer: bytearray = bytearray()
+        self.keep_alive: bool = True
+        self.request_count: int = 0
         self._ws_client: AsyncWSClient | None = None
-        self._ws_mode = False
+        self._ws_mode: bool = False
 
-    def connection_made(self, transport: asyncio.Transport) -> None:
-        self.transport = transport
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = cast(asyncio.Transport, transport)
         # Socket optimizations (Gunicorn/uWSGI patterns)
         sock = transport.get_extra_info("socket")
         if sock:
@@ -1285,71 +1061,36 @@ class AsyncHTTPProtocol(asyncio.Protocol):
     def connection_lost(self, exc: Exception | None) -> None:
         self.transport = None
 
-    def data_received(self, data: bytes) -> None:
-        # If in WebSocket mode, feed data to WS client
-        if self._ws_mode and self._ws_client:
-            self._ws_client.feed_data(data)
-            return
-        self.buffer.extend(data)
-        self._process_buffer()
+    async def _ws_message_loop(self, ws: AsyncWSClient) -> None:
+        """Handle WebSocket message loop asynchronously."""
+        while True:
+            opcode, data = await ws.recv_async()
 
-    def _process_buffer(self) -> None:
-        """Process buffered data for complete HTTP requests."""
-        while b"\r\n\r\n" in self.buffer:
-            # Find end of headers
-            header_end = self.buffer.find(b"\r\n\r\n")
-            if header_end == -1:
-                return
+            if opcode is None or opcode == WSOpcode.CLOSE:
+                ws.send(b"", WSOpcode.CLOSE)
+                break
 
-            header_data = bytes(self.buffer[:header_end])
-            body_start = header_end + 4
+            if opcode == WSOpcode.PING:
+                ws.send(data or b"", WSOpcode.PONG)
+                continue
 
-            # Parse request line and headers
-            lines = header_data.split(b"\r\n")
-            if not lines:
-                self._send_error(400)
-                return
+            if opcode == WSOpcode.TEXT and data is not None:
+                try:
+                    text_data = (
+                        data.decode("utf-8") if isinstance(data, bytes) else data
+                    )
+                    msg = _json_loads(text_data)
+                    ctx = WSMessage(ws=ws, data=msg, reply=None, stop=False)
+                    app.emit("ws:message", ctx)
 
-            # Parse request line: METHOD PATH HTTP/1.x
-            request_line = lines[0].decode("latin-1")
-            parts = request_line.split(" ", 2)
-            if len(parts) != 3:
-                self._send_error(400)
-                return
-
-            method, path, _ = parts
-
-            # Parse headers
-            headers: dict[str, str] = {}
-            for line in lines[1:]:
-                if b": " in line:
-                    key, val = line.split(b": ", 1)
-                    headers[key.decode("latin-1")] = val.decode("latin-1")
-
-            # Check for WebSocket upgrade
-            if path == settings.ws_path and headers.get("Upgrade", "").lower() == "websocket":
-                ws_key = headers.get("Sec-WebSocket-Key")
-                if ws_key and self.transport:
-                    # Remove processed data
-                    del self.buffer[:body_start]
-                    # Handle WebSocket upgrade
-                    asyncio.create_task(self._handle_websocket(ws_key, headers))
-                    return
-
-            # Determine content length
-            content_length = int(headers.get("Content-Length", "0"))
-
-            # Check if we have complete body
-            if len(self.buffer) < body_start + content_length:
-                return  # Wait for more data
-
-            # Extract body
-            body_data = bytes(self.buffer[body_start:body_start + content_length])
-            del self.buffer[:body_start + content_length]
-
-            # Process request
-            self.request_count += 1
-            asyncio.create_task(self._handle_request(method, path, headers, body_data))
+                    if ctx.stop:
+                        continue
+                    if ctx.reply is not None:
+                        ws.send(ctx.reply)
+                    else:
+                        ws.send({"echo": msg})
+                except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+                    ws.send({"error": "invalid json"})
 
     async def _handle_websocket(self, ws_key: str, headers: dict[str, str]) -> None:
         """Handle WebSocket upgrade asynchronously using asyncio streams."""
@@ -1387,34 +1128,54 @@ class AsyncHTTPProtocol(asyncio.Protocol):
             if self.transport and not self.transport.is_closing():
                 self.transport.close()
 
-    async def _ws_message_loop(self, ws: "AsyncWSClient") -> None:
-        """Handle WebSocket message loop asynchronously."""
-        while True:
-            opcode, data = await ws.recv_async()
+    def _send_response(self, res: Response) -> None:
+        """Send HTTP response using pre-built headers for speed."""
+        if not self.transport:
+            return
 
-            if opcode is None or opcode == WSOpcode.CLOSE:
-                ws.send(b"", WSOpcode.CLOSE)
-                break
+        # Serialize body
+        content_type = res.headers.get("Content-Type")
+        is_json = content_type is None or content_type == CONTENT_TYPE_JSON
+        if is_json:
+            body = _json_dumps_cached(res.body)
+            content_type = CONTENT_TYPE_JSON
+        elif isinstance(res.body, bytes):
+            body = res.body
+        else:
+            body = str(res.body).encode()
 
-            if opcode == WSOpcode.PING:
-                ws.send(data or b"", WSOpcode.PONG)
-                continue
+        # Fast path: use pre-built status line if available
+        status_line = _PREBUILT_HEADERS.get(res.status)
+        if status_line is None:
+            status_text = _HTTP_STATUS.get(res.status, "OK")
+            status_line = f"HTTP/1.1 {res.status} {status_text}\r\n".encode()
 
-            if opcode == WSOpcode.TEXT and data is not None:
-                try:
-                    text_data = data.decode("utf-8") if isinstance(data, bytes) else data
-                    msg = _json_loads(text_data)
-                    ctx = WSMessage(ws=ws, data=msg, reply=None, stop=False)
-                    app.emit("ws:message", ctx)
+        # Build response using bytes concatenation (faster than string join)
+        parts = [status_line]
 
-                    if ctx.stop:
-                        continue
-                    if ctx.reply is not None:
-                        ws.send(ctx.reply)
-                    else:
-                        ws.send({"echo": msg})
-                except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
-                    ws.send({"error": "invalid json"})
+        # Content-Type header
+        if is_json:
+            parts.append(_HEADER_JSON)
+        else:
+            parts.append(f"Content-Type: {content_type}\r\n".encode())
+
+        # Content-Length
+        parts.append(f"Content-Length: {len(body)}\r\n".encode())
+
+        # Custom headers
+        for k, v in res.headers.items():
+            if k != "Content-Type":
+                parts.append(f"{k}: {v}\r\n".encode())
+
+        # Connection header
+        parts.append(_HEADER_KEEPALIVE if self.keep_alive else _HEADER_CLOSE)
+
+        # End headers and body
+        parts.append(b"\r\n")
+        parts.append(body)
+
+        # Single write call (more efficient than multiple writes)
+        self.transport.write(b"".join(parts))
 
     async def _handle_request(
         self, method: str, path: str, headers: dict[str, str], body_data: bytes
@@ -1439,7 +1200,9 @@ class AsyncHTTPProtocol(asyncio.Protocol):
             body = None
 
         # Create request/response
-        req = Request(method=method, path=path_clean, headers=headers, query=query, body=body)
+        req = Request(
+            method=method, path=path_clean, headers=headers, query=query, body=body
+        )
         res = Response(status=200, body={}, headers={}, stop=False)
 
         # Run middleware
@@ -1496,55 +1259,6 @@ class AsyncHTTPProtocol(asyncio.Protocol):
 
         self._send_response(res)
 
-    def _send_response(self, res: Response) -> None:
-        """Send HTTP response using pre-built headers for speed."""
-        if not self.transport:
-            return
-
-        # Serialize body
-        content_type = res.headers.get("Content-Type")
-        is_json = content_type is None or content_type == CONTENT_TYPE_JSON
-        if is_json:
-            body = _json_dumps_cached(res.body)
-            content_type = CONTENT_TYPE_JSON
-        elif isinstance(res.body, bytes):
-            body = res.body
-        else:
-            body = str(res.body).encode()
-
-        # Fast path: use pre-built status line if available
-        status_line = _PREBUILT_HEADERS.get(res.status)
-        if status_line is None:
-            status_text = _HTTP_STATUS.get(res.status, "OK")
-            status_line = f"HTTP/1.1 {res.status} {status_text}\r\n".encode()
-
-        # Build response using bytes concatenation (faster than string join)
-        parts = [status_line]
-
-        # Content-Type header
-        if is_json:
-            parts.append(_HEADER_JSON)
-        else:
-            parts.append(f"Content-Type: {content_type}\r\n".encode())
-
-        # Content-Length
-        parts.append(f"Content-Length: {len(body)}\r\n".encode())
-
-        # Custom headers
-        for k, v in res.headers.items():
-            if k != "Content-Type":
-                parts.append(f"{k}: {v}\r\n".encode())
-
-        # Connection header
-        parts.append(_HEADER_KEEPALIVE if self.keep_alive else _HEADER_CLOSE)
-
-        # End headers and body
-        parts.append(b"\r\n")
-        parts.append(body)
-
-        # Single write call (more efficient than multiple writes)
-        self.transport.write(b"".join(parts))
-
     def _send_error(self, status: int) -> None:
         """Send error response."""
         if self.transport:
@@ -1559,6 +1273,75 @@ class AsyncHTTPProtocol(asyncio.Protocol):
             )
             self.transport.write(response.encode())
             self.transport.close()
+
+    def _process_buffer(self) -> None:
+        """Process buffered data for complete HTTP requests."""
+        while b"\r\n\r\n" in self.buffer:
+            # Find end of headers
+            header_end = self.buffer.find(b"\r\n\r\n")
+            if header_end == -1:
+                return
+
+            header_data = bytes(self.buffer[:header_end])
+            body_start = header_end + 4
+
+            # Parse request line and headers
+            lines = header_data.split(b"\r\n")
+            if not lines:
+                self._send_error(400)
+                return
+
+            # Parse request line: METHOD PATH HTTP/1.x
+            request_line = lines[0].decode("latin-1")
+            parts = request_line.split(" ", 2)
+            if len(parts) != 3:
+                self._send_error(400)
+                return
+
+            method, path, _ = parts
+
+            # Parse headers
+            headers: dict[str, str] = {}
+            for line in lines[1:]:
+                if b": " in line:
+                    key, val = line.split(b": ", 1)
+                    headers[key.decode("latin-1")] = val.decode("latin-1")
+
+            # Check for WebSocket upgrade
+            if (
+                path == settings.ws_path
+                and headers.get("Upgrade", "").lower() == "websocket"
+            ):
+                ws_key = headers.get("Sec-WebSocket-Key")
+                if ws_key and self.transport:
+                    # Remove processed data
+                    del self.buffer[:body_start]
+                    # Handle WebSocket upgrade
+                    asyncio.create_task(self._handle_websocket(ws_key, headers))
+                    return
+
+            # Determine content length
+            content_length = int(headers.get("Content-Length", "0"))
+
+            # Check if we have complete body
+            if len(self.buffer) < body_start + content_length:
+                return  # Wait for more data
+
+            # Extract body
+            body_data = bytes(self.buffer[body_start : body_start + content_length])
+            del self.buffer[: body_start + content_length]
+
+            # Process request
+            self.request_count += 1
+            asyncio.create_task(self._handle_request(method, path, headers, body_data))
+
+    def data_received(self, data: bytes) -> None:
+        # If in WebSocket mode, feed data to WS client
+        if self._ws_mode and self._ws_client:
+            self._ws_client.feed_data(data)
+            return
+        self.buffer.extend(data)
+        self._process_buffer()
 
 
 async def _run_async_server(host: str, port: int) -> None:
@@ -1589,74 +1372,25 @@ def _async_worker_process(host: str, port: int, worker_id: int) -> None:
     _setup_event_loop()
     if settings.debug:
         print(f"[Worker {worker_id}] Starting async server on {host}:{port}")
-    try:
+    with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(_run_async_server(host, port))
-    except KeyboardInterrupt:
-        pass
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Server (Legacy Threading-based)
+# Server
 # ──────────────────────────────────────────────────────────────────────────────
-
-
-class ReuseAddrThreadingHTTPServer(ThreadingHTTPServer):
-    """ThreadingHTTPServer with socket reuse options for performance."""
-
-    allow_reuse_address = True
-    allow_reuse_port = True
-    request_queue_size = 2048
-
-    def server_bind(self) -> None:
-        """Bind server with optimized socket options."""
-        # Enable address reuse
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-        # Enable port reuse if supported (allows multiple processes on Unix)
-        if settings.reuse_port and SO_REUSEPORT is not None:
-            try:
-                self.socket.setsockopt(socket.SOL_SOCKET, SO_REUSEPORT, 1)
-            except OSError:
-                pass  # Not supported on this platform
-
-        # Increase socket buffers (64KB is a good balance)
-        try:
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
-        except OSError:
-            pass
-
-        super().server_bind()
-        self.server_address = self.socket.getsockname()
-
-
-def _worker_process(host: str, port: int, worker_id: int) -> None:
-    """Worker process that runs its own HTTP server."""
-    server = ReuseAddrThreadingHTTPServer((host, port), HTTPHandler)
-    if settings.debug:
-        print(f"[Worker {worker_id}] Started on {host}:{port}")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.shutdown()
 
 
 @dataclass
 class Server:
     """HTTP + WebSocket server with start/stop lifecycle and multiprocessing.
 
-    Supports two modes:
-    - Async mode (default): Uses asyncio for high performance. Optionally uses
-      uvloop (Unix) or winloop (Windows) if installed for even better performance.
-    - Threading mode: Uses ThreadingHTTPServer. Set `settings.use_async = False`.
+    Uses asyncio for high performance. Optionally uses uvloop (Unix) or
+    winloop (Windows) if installed for even better performance.
     """
 
-    _http: ReuseAddrThreadingHTTPServer | None = field(default=None, repr=False)
     _running: bool = field(default=False, repr=False)
     _workers: list[multiprocessing.Process] = field(default_factory=list, repr=False)
-    _async_task: asyncio.Task[None] | None = field(default=None, repr=False)
 
     def start(self) -> None:
         """Start the server with optional worker processes."""
@@ -1665,45 +1399,25 @@ class Server:
 
         num_workers = settings.workers
 
-        if settings.use_async:
-            # Async mode - use asyncio-based server
-            if num_workers > 1 and sys.platform != "win32":
-                # Multiprocess async mode (Unix only)
-                for i in range(num_workers):
-                    p = multiprocessing.Process(
-                        target=_async_worker_process,
-                        args=(settings.host, settings.port, i),
-                        daemon=True,
-                    )
-                    p.start()
-                    self._workers.append(p)
-            else:
-                # Single process async mode
-                _setup_event_loop()
-
-                def run_async() -> None:
-                    try:
-                        asyncio.run(_run_async_server(settings.host, settings.port))
-                    except KeyboardInterrupt:
-                        pass
-
-                threading.Thread(target=run_async, daemon=True).start()
-        else:
-            # Legacy threading mode
-            if num_workers > 1 and sys.platform != "win32":
-                for i in range(num_workers):
-                    p = multiprocessing.Process(
-                        target=_worker_process,
-                        args=(settings.host, settings.port, i),
-                        daemon=True,
-                    )
-                    p.start()
-                    self._workers.append(p)
-            else:
-                self._http = ReuseAddrThreadingHTTPServer(
-                    (settings.host, settings.port), HTTPHandler
+        if num_workers > 1 and sys.platform != "win32":
+            # Multiprocess mode (Unix only)
+            for i in range(num_workers):
+                p = multiprocessing.Process(
+                    target=_async_worker_process,
+                    args=(settings.host, settings.port, i),
+                    daemon=True,
                 )
-                threading.Thread(target=self._http.serve_forever, daemon=True).start()
+                p.start()
+                self._workers.append(p)
+        else:
+            # Single process mode
+            _setup_event_loop()
+
+            def run_async() -> None:
+                with contextlib.suppress(KeyboardInterrupt):
+                    asyncio.run(_run_async_server(settings.host, settings.port))
+
+            threading.Thread(target=run_async, daemon=True).start()
 
     def stop(self) -> None:
         """Stop the server and all workers."""
@@ -1716,9 +1430,6 @@ class Server:
             p.join(timeout=1)
         self._workers.clear()
 
-        if self._http:
-            self._http.shutdown()
-
     @staticmethod
     def run(plugin: list[Plugin] | None = None) -> None:
         """Start the server using global settings, optionally with plugins."""
@@ -1728,13 +1439,6 @@ class Server:
 
         server = Server()
         server.start()
-
-        if settings.debug and not settings.use_async:
-            workers_info = (
-                f" ({settings.workers} workers)" if settings.workers > 1 else ""
-            )
-            print(f"[Server] http://{settings.host}:{settings.port}{workers_info}")
-            print(f"[WebSocket] ws://{settings.host}:{settings.port}{settings.ws_path}")
 
         # Keep main thread alive
         try:
